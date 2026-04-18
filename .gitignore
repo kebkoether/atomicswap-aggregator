@@ -25,3 +25,9 @@ contracts/target/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Node compile cache
+node-compile-cache/
+
+# TypeScript build info
+*.tsbuildinfo
