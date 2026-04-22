@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useWallet } from '@/context/WalletContext';
-import { getQuote as fetchQuote, buildPeerSwap } from '@/lib/api';
+import { getQuote as fetchQuote, buildPeerSwap, getOraclePrice } from '@/lib/api';
 
 // ─── Token Data ─────────────────────────────────────────
 
@@ -281,7 +281,62 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   const [loading, setLoading] = useState(false);
   const [quote, setQuote] = useState<any>(null);
   const [p2pPlan, setP2pPlan] = useState<any>(null);
+  const [priceMode, setPriceMode] = useState<'fixed' | 'market'>('fixed');
+  const [maxSlippageBps, setMaxSlippageBps] = useState(50); // 0.50% default
+  const [autoRouteMinutes, setAutoRouteMinutes] = useState(0); // 0 = no timer
+  const [oraclePrice, setOraclePrice] = useState<number | null>(null);
   const { connected: walletConnected, address: walletAddress, connect: connectWallet } = useWallet();
+
+  // Determine if either side is a volatile asset (needs oracle pricing)
+  const isVolatilePair = tokenIn === 'SolvBTC' || tokenOut === 'SolvBTC';
+
+  // Fetch oracle price when in P2P + Market mode with a volatile pair
+  useEffect(() => {
+    if (mode === 'p2p' && priceMode === 'market' && isVolatilePair) {
+      const btcSide = tokenIn === 'SolvBTC' ? tokenIn : tokenOut;
+      const stableSide = tokenIn === 'SolvBTC' ? tokenOut : tokenIn;
+      getOraclePrice(btcSide, stableSide).then((data) => {
+        if (data.available && data.price) setOraclePrice(data.price);
+      }).catch(() => {});
+    }
+  }, [mode, priceMode, tokenIn, tokenOut, isVolatilePair]);
+
+  const [submitting, setSubmitting] = useState(false);
+
+  // ─── Auto-quote: fetch as user types (debounced) ──────
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const fetchQuoteDebounced = useCallback(
+    (amount: string, tIn: string, tOut: string) => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (!amount || parseFloat(amount) <= 0) {
+        setQuote(null);
+        return;
+      }
+      debounceRef.current = setTimeout(async () => {
+        try {
+          setLoading(true);
+          const baseAmount = Math.floor(parseFloat(amount) * 1e7).toString();
+          const data = await fetchQuote(tIn, tOut, baseAmount);
+          setQuote(data);
+          onRouteComputed(data);
+        } catch (error) {
+          console.error('Quote error:', error);
+        } finally {
+          setLoading(false);
+        }
+      }, 400); // 400ms debounce
+    },
+    [onRouteComputed]
+  );
+
+  // Trigger auto-quote when amount/tokens change in instant mode
+  useEffect(() => {
+    if (mode === 'instant') {
+      fetchQuoteDebounced(amountIn, tokenIn, tokenOut);
+    }
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
+  }, [amountIn, tokenIn, tokenOut, mode, fetchQuoteDebounced]);
 
   const handleSwapTokens = useCallback(() => {
     const prev = tokenIn;
@@ -290,21 +345,6 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     setQuote(null);
     setP2pPlan(null);
   }, [tokenIn, tokenOut]);
-
-  const handleGetQuote = useCallback(async () => {
-    if (!amountIn || parseFloat(amountIn) <= 0) return;
-    setLoading(true);
-    try {
-      const baseAmount = Math.floor(parseFloat(amountIn) * 1e7).toString();
-      const data = await fetchQuote(tokenIn, tokenOut, baseAmount);
-      setQuote(data);
-      onRouteComputed(data);
-    } catch (error) {
-      console.error('Quote error:', error);
-    } finally {
-      setLoading(false);
-    }
-  }, [amountIn, tokenIn, tokenOut, onRouteComputed]);
 
   const handleP2pCheck = useCallback(async () => {
     if (!amountIn || parseFloat(amountIn) <= 0) return;
@@ -316,7 +356,10 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         tokenIn,
         tokenOut,
         amountIn: baseAmount,
-        minAmountOut: baseAmount,
+        minAmountOut: priceMode === 'market' ? '0' : baseAmount,
+        priceMode: priceMode === 'market' ? 1 : 0,
+        maxSlippageBps: priceMode === 'market' ? maxSlippageBps : undefined,
+        autoRouteMinutes: autoRouteMinutes > 0 ? autoRouteMinutes : undefined,
       });
       setP2pPlan(data.plan);
     } catch (error) {
@@ -324,9 +367,64 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     } finally {
       setLoading(false);
     }
-  }, [amountIn, tokenIn, tokenOut, walletAddress]);
+  }, [amountIn, tokenIn, tokenOut, walletAddress, priceMode, maxSlippageBps, autoRouteMinutes]);
 
-  // Wallet connection is handled by the shared WalletContext
+  // Submit the P2P order (sign + send the transaction)
+  const handleP2pSubmit = useCallback(async () => {
+    if (!walletAddress || !p2pPlan) return;
+    setSubmitting(true);
+    try {
+      const baseAmount = Math.floor(parseFloat(amountIn) * 1e7).toString();
+      const data = await buildPeerSwap({
+        sourceAddress: walletAddress,
+        tokenIn,
+        tokenOut,
+        amountIn: baseAmount,
+        minAmountOut: priceMode === 'market' ? '0' : baseAmount,
+        priceMode: priceMode === 'market' ? 1 : 0,
+        maxSlippageBps: priceMode === 'market' ? maxSlippageBps : undefined,
+        autoRouteMinutes: autoRouteMinutes > 0 ? autoRouteMinutes : undefined,
+      });
+
+      if (data.xdrs && data.xdrs.length > 0) {
+        // Sign each transaction with Freighter
+        const freighter = await import('@stellar/freighter-api');
+        for (const xdrStr of data.xdrs) {
+          const signed = await freighter.signTransaction(xdrStr, {
+            networkPassphrase: 'Test SDF Network ; September 2015',
+          });
+          // Submit signed transaction
+          const { submitTransaction } = await import('@/lib/api');
+          await submitTransaction(signed);
+        }
+        alert('Order placed successfully! Check the Orders tab to see it.');
+        setP2pPlan(null);
+        setAmountIn('');
+      } else {
+        alert('Order plan ready but no transactions to sign yet. The smart contracts need SAC addresses configured to build real transactions.');
+      }
+    } catch (error: any) {
+      console.error('P2P submit error:', error);
+      alert(`Failed to submit: ${error?.message || 'Unknown error'}`);
+    } finally {
+      setSubmitting(false);
+    }
+  }, [walletAddress, p2pPlan, amountIn, tokenIn, tokenOut, priceMode, maxSlippageBps, autoRouteMinutes]);
+
+  // Handle instant swap execution
+  const handleInstantSwap = useCallback(async () => {
+    if (!walletAddress || !quote) return;
+    setSubmitting(true);
+    try {
+      // TODO: build and sign instant swap transaction via Router contract
+      alert('Instant swap signing not yet wired up — coming soon!');
+    } catch (error: any) {
+      console.error('Swap error:', error);
+      alert(`Failed: ${error?.message || 'Unknown error'}`);
+    } finally {
+      setSubmitting(false);
+    }
+  }, [walletAddress, quote]);
 
   const formatOutput = (raw: string) => {
     if (!raw) return '0.00';
@@ -379,7 +477,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           label="Selling"
           sublabel="Balance: --"
           value={amountIn}
-          onChange={(v) => { setAmountIn(v); setQuote(null); setP2pPlan(null); }}
+          onChange={(v) => { setAmountIn(v); setP2pPlan(null); }}
           token={tokenIn}
           tokens={TOKENS}
           onTokenSelect={(s) => { setTokenIn(s); if (s === tokenOut) setTokenOut(tokenIn); setQuote(null); setP2pPlan(null); }}
@@ -414,9 +512,17 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
 
         {/* Buying */}
         <InputPanel
-          label="Buying"
-          sublabel="Balance: --"
-          value={quote ? formatOutput(quote.netAmountOut) : ''}
+          label={mode === 'instant' ? 'Buying' : 'Buying (estimated)'}
+          sublabel={loading ? 'Fetching...' : 'Balance: --'}
+          value={
+            mode === 'instant' && quote
+              ? formatOutput(quote.netAmountOut)
+              : mode === 'p2p' && amountIn && parseFloat(amountIn) > 0
+              ? p2pPlan
+                ? formatOutput(p2pPlan.summary?.instantFillAmount || '0')
+                : `~${parseFloat(amountIn).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+              : ''
+          }
           readOnly
           token={tokenOut}
           tokens={TOKENS}
@@ -424,6 +530,136 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           excludeToken={tokenIn}
           accent="#22c55e"
         />
+
+        {/* P2P Options: Price Mode + Timer */}
+        {mode === 'p2p' && (
+          <div style={{ marginTop: '14px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {/* Price Mode Toggle */}
+            <div
+              style={{
+                background: '#161b26',
+                borderRadius: '12px',
+                padding: '14px',
+                border: '1px solid #252a3a',
+              }}
+            >
+              <div style={{ fontSize: '12px', fontWeight: 700, color: '#8a8f9c', marginBottom: '10px', textTransform: 'uppercase', letterSpacing: '0.8px' }}>
+                Price Mode
+              </div>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                {([
+                  { key: 'fixed' as const, label: 'Fixed Price', desc: 'Set your exact minimum output' },
+                  { key: 'market' as const, label: 'Market Price', desc: 'Oracle-pegged with slippage tolerance' },
+                ] as const).map((opt) => (
+                  <button
+                    key={opt.key}
+                    onClick={() => { setPriceMode(opt.key); setP2pPlan(null); }}
+                    style={{
+                      flex: 1,
+                      padding: '10px 8px',
+                      borderRadius: '10px',
+                      border: priceMode === opt.key ? '1px solid #6366f1' : '1px solid #1a1f2e',
+                      background: priceMode === opt.key ? 'rgba(99, 102, 241, 0.08)' : 'transparent',
+                      cursor: 'pointer',
+                      textAlign: 'center',
+                    }}
+                  >
+                    <div style={{ fontSize: '13px', fontWeight: 600, color: priceMode === opt.key ? '#e1e4ea' : '#565b68' }}>
+                      {opt.label}
+                    </div>
+                    <div style={{ fontSize: '10px', color: priceMode === opt.key ? '#6366f1' : '#3a3f4c', marginTop: '2px' }}>
+                      {opt.desc}
+                    </div>
+                  </button>
+                ))}
+              </div>
+
+              {/* Market mode details */}
+              {priceMode === 'market' && (
+                <div style={{ marginTop: '10px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                    <span style={{ fontSize: '12px', color: '#8a8f9c' }}>Max slippage</span>
+                    <div style={{ display: 'flex', gap: '4px' }}>
+                      {[25, 50, 100, 200].map((bps) => (
+                        <button
+                          key={bps}
+                          onClick={() => { setMaxSlippageBps(bps); setP2pPlan(null); }}
+                          style={{
+                            padding: '4px 8px',
+                            borderRadius: '6px',
+                            border: maxSlippageBps === bps ? '1px solid #6366f1' : '1px solid #1a1f2e',
+                            background: maxSlippageBps === bps ? 'rgba(99, 102, 241, 0.1)' : 'transparent',
+                            color: maxSlippageBps === bps ? '#e1e4ea' : '#565b68',
+                            fontSize: '11px',
+                            fontWeight: 600,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          {(bps / 100).toFixed(2)}%
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  {isVolatilePair && oraclePrice && (
+                    <div style={{ fontSize: '11px', color: '#8a8f9c', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#22c55e', display: 'inline-block' }} />
+                      Oracle: 1 SolvBTC = ${oraclePrice.toLocaleString('en-US', { maximumFractionDigits: 2 })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Auto-Route Timer */}
+            <div
+              style={{
+                background: '#161b26',
+                borderRadius: '12px',
+                padding: '14px',
+                border: '1px solid #252a3a',
+              }}
+            >
+              <div style={{ fontSize: '12px', fontWeight: 700, color: '#8a8f9c', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.8px' }}>
+                Auto-Route Timer
+              </div>
+              <div style={{ fontSize: '12px', color: '#8a8f9c', marginBottom: '10px' }}>
+                No peer match in time? Auto-route through DEX liquidity.
+              </div>
+              <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                {[
+                  { mins: 0, label: 'No limit' },
+                  { mins: 5, label: '5 min' },
+                  { mins: 15, label: '15 min' },
+                  { mins: 30, label: '30 min' },
+                  { mins: 60, label: '1 hour' },
+                ].map((opt) => (
+                  <button
+                    key={opt.mins}
+                    onClick={() => { setAutoRouteMinutes(opt.mins); setP2pPlan(null); }}
+                    style={{
+                      padding: '8px 14px',
+                      borderRadius: '8px',
+                      border: autoRouteMinutes === opt.mins ? '1px solid #6366f1' : '1px solid #2a3040',
+                      background: autoRouteMinutes === opt.mins ? 'rgba(99, 102, 241, 0.15)' : 'rgba(255,255,255,0.03)',
+                      color: autoRouteMinutes === opt.mins ? '#e1e4ea' : '#8a8f9c',
+                      fontSize: '13px',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              {autoRouteMinutes > 0 && (
+                <div style={{ marginTop: '8px', fontSize: '11px', color: '#eab308', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><circle cx="6" cy="6" r="5" stroke="currentColor" strokeWidth="1.2"/><path d="M6 3v3.5l2 1.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>
+                  After {autoRouteMinutes} min with no P2P match, your order auto-routes through DEXs at market rate.
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* P2P Match info */}
         {mode === 'p2p' && amountIn && parseFloat(amountIn) > 0 && (
@@ -527,68 +763,80 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         )}
 
         {/* Action button */}
-        {!walletConnected ? (
-          <button
-            onClick={connectWallet}
-            style={{
-              width: '100%',
-              marginTop: '16px',
-              padding: '16px',
-              borderRadius: '14px',
-              border: 'none',
-              background: 'linear-gradient(135deg, #6366f1, #7c3aed)',
-              color: 'white',
-              fontSize: '16px',
-              fontWeight: 600,
-              cursor: 'pointer',
-              letterSpacing: '-0.2px',
-            }}
-          >
-            Connect Wallet
-          </button>
-        ) : (
-          <button
-            onClick={
-              mode === 'instant' && !quote
-                ? handleGetQuote
-                : mode === 'p2p' && !p2pPlan
-                ? handleP2pCheck
-                : undefined
+        {(() => {
+          const hasAmount = amountIn && parseFloat(amountIn) > 0;
+          const disabled = !hasAmount || loading || submitting;
+
+          // Determine button action and label
+          let onClick: (() => void) | undefined;
+          let label = 'Enter an amount';
+          let showGreen = false; // Use green for "confirm" actions
+
+          if (!walletConnected) {
+            onClick = connectWallet;
+            label = 'Connect Wallet';
+          } else if (submitting) {
+            label = 'Signing transaction...';
+          } else if (loading) {
+            label = mode === 'p2p' ? 'Checking for matches...' : 'Finding best route...';
+          } else if (mode === 'instant') {
+            if (quote && hasAmount) {
+              onClick = handleInstantSwap;
+              label = `Swap ${parseFloat(amountIn).toLocaleString()} ${tokenIn} → ${formatOutput(quote.netAmountOut)} ${tokenOut}`;
+              showGreen = true;
+            } else if (hasAmount) {
+              // Auto-quoting is in progress or failed — show loading state
+              label = 'Fetching quote...';
             }
-            disabled={!amountIn || parseFloat(amountIn) <= 0 || loading}
-            style={{
-              width: '100%',
-              marginTop: '16px',
-              padding: '16px',
-              borderRadius: '14px',
-              border: 'none',
-              background: !amountIn || parseFloat(amountIn) <= 0
-                ? '#1a1f2e'
-                : 'linear-gradient(135deg, #6366f1, #7c3aed)',
-              color: !amountIn || parseFloat(amountIn) <= 0 ? '#565b68' : 'white',
-              fontSize: '16px',
-              fontWeight: 600,
-              cursor: !amountIn || parseFloat(amountIn) <= 0 || loading ? 'not-allowed' : 'pointer',
-              letterSpacing: '-0.2px',
-            }}
-          >
-            {loading
-              ? mode === 'p2p' ? 'Checking for matches...' : 'Finding best route...'
-              : mode === 'p2p'
-              ? amountIn && parseFloat(amountIn) > 0
-                ? p2pPlan
-                  ? p2pPlan.fills?.length > 0
-                    ? `Fill ${p2pPlan.fills.length} match${p2pPlan.fills.length > 1 ? 'es' : ''}${p2pPlan.remainder ? ' + escrow remainder' : ''}`
-                    : `Escrow ${parseFloat(amountIn).toLocaleString()} ${tokenIn} · wait for P2P match`
-                  : 'Find P2P matches'
-                : 'Enter an amount'
-              : quote
-              ? `Swap ${parseFloat(amountIn).toLocaleString()} ${tokenIn} → ${formatOutput(quote.netAmountOut)} ${tokenOut}`
-              : amountIn && parseFloat(amountIn) > 0
-              ? 'Get Quote'
-              : 'Enter an amount'}
-          </button>
-        )}
+          } else if (mode === 'p2p') {
+            if (!hasAmount) {
+              label = 'Enter an amount';
+            } else if (!p2pPlan) {
+              onClick = handleP2pCheck;
+              label = 'Find P2P Matches';
+            } else {
+              // Plan loaded — button submits the order
+              onClick = handleP2pSubmit;
+              showGreen = true;
+              if (p2pPlan.fills?.length > 0) {
+                label = p2pPlan.remainder
+                  ? `Fill ${p2pPlan.fills.length} match${p2pPlan.fills.length > 1 ? 'es' : ''} + escrow remainder`
+                  : `Fill ${p2pPlan.fills.length} match${p2pPlan.fills.length > 1 ? 'es' : ''} now`;
+              } else {
+                label = `Place Order · escrow ${parseFloat(amountIn).toLocaleString()} ${tokenIn}`;
+              }
+            }
+          }
+
+          return (
+            <button
+              onClick={onClick}
+              disabled={disabled && walletConnected}
+              style={{
+                width: '100%',
+                marginTop: '16px',
+                padding: '16px',
+                borderRadius: '14px',
+                border: 'none',
+                background: !walletConnected
+                  ? 'linear-gradient(135deg, #6366f1, #7c3aed)'
+                  : disabled
+                  ? '#1a1f2e'
+                  : showGreen
+                  ? 'linear-gradient(135deg, #16a34a, #15803d)'
+                  : 'linear-gradient(135deg, #6366f1, #7c3aed)',
+                color: disabled && walletConnected ? '#565b68' : 'white',
+                fontSize: '16px',
+                fontWeight: 600,
+                cursor: (disabled && walletConnected) ? 'not-allowed' : 'pointer',
+                letterSpacing: '-0.2px',
+                transition: 'all 0.15s ease',
+              }}
+            >
+              {label}
+            </button>
+          );
+        })()}
 
         {/* Connected wallet indicator */}
         {walletConnected && walletAddress && (

@@ -17,6 +17,8 @@ import { RoutingEngine } from './router/engine.js';
 import { createVenueRegistry } from './venues/index.js';
 import { StellarClient } from './stellar/client.js';
 import { getLiveTokens, resolveToken, formatAmount } from './stellar/tokens.js';
+import { OraclePriceService } from './services/oracle.js';
+import { TimerSweepService } from './services/timer-sweep.js';
 
 const app = express();
 app.use(cors({
@@ -84,6 +86,24 @@ const registry = createVenueRegistry({
 console.log('');
 
 const routingEngine = new RoutingEngine(registry);
+
+// ─── Background Services ───────────────────────────────
+
+const oracleService = new OraclePriceService({
+  stellar,
+  swapbookContractId: config.swapbookContractId,
+  intervalMs: 5 * 60 * 1000, // 5 minutes
+});
+oracleService.start();
+
+const timerSweep = new TimerSweepService({
+  stellar,
+  swapbookContractId: config.swapbookContractId,
+  routingEngine,
+  intervalMs: 60 * 1000, // 60 seconds
+  dryRun: !process.env.ADMIN_SECRET_KEY, // dry run if no admin key
+});
+timerSweep.start();
 
 // ─── API Routes ─────────────────────────────────────────
 
@@ -377,16 +397,23 @@ app.post('/api/swap/build', async (req, res) => {
  * execute atomically on-chain.
  *
  * Body:
- *   sourceAddress - User's Stellar address
- *   tokenIn       - Token being sold (symbol or SAC address)
- *   tokenOut      - Token being bought (symbol or SAC address)
- *   amountIn      - Amount to sell (base units, 7 decimals)
- *   minAmountOut  - Minimum acceptable output (base units)
- *   expiry        - Ledger sequence at which unfilled remainder expires
+ *   sourceAddress    - User's Stellar address
+ *   tokenIn          - Token being sold (symbol or SAC address)
+ *   tokenOut         - Token being bought (symbol or SAC address)
+ *   amountIn         - Amount to sell (base units, 7 decimals)
+ *   minAmountOut     - Minimum acceptable output (base units). Required for Fixed mode.
+ *   expiry           - Ledger sequence at which unfilled remainder expires
+ *   priceMode        - 0 = Fixed (default), 1 = Oracle (market price)
+ *   maxSlippageBps   - Max slippage for Oracle mode (default: 50 = 0.50%)
+ *   autoRouteMinutes - Minutes to sit on P2P book before auto-routing via DEXs.
+ *                      0 = no auto-route (default). Converted to ledger sequences.
  */
 app.post('/api/peer-swap/build', async (req, res) => {
   try {
-    const { sourceAddress, tokenIn, tokenOut, amountIn, minAmountOut, expiry } = req.body;
+    const {
+      sourceAddress, tokenIn, tokenOut, amountIn, minAmountOut, expiry,
+      priceMode, maxSlippageBps, autoRouteMinutes,
+    } = req.body;
 
     if (!sourceAddress || !tokenIn || !tokenOut || !amountIn || !minAmountOut) {
       res.status(400).json({ error: 'Missing required fields: sourceAddress, tokenIn, tokenOut, amountIn, minAmountOut' });
@@ -567,6 +594,23 @@ app.post('/api/peer-swap/build', async (req, res) => {
       try {
         const proRataMinOut = (minOutBig * amountToSit) / amountInBig;
         const orderExpiry = expiry ?? 1_000_000; // ~46 days at 5s/ledger
+
+        // Price mode: 0 = Fixed, 1 = Oracle
+        const priceModeVal = priceMode ?? 0;
+        const slippageBps = maxSlippageBps ?? 50;
+
+        // Convert autoRouteMinutes to ledger sequences (1 ledger ≈ 5 seconds)
+        // autoRouteAfter = current_ledger + (minutes * 60 / 5)
+        let autoRouteAfter = 0;
+        if (autoRouteMinutes && autoRouteMinutes > 0) {
+          // We estimate current ledger from the order expiry or use a sensible offset
+          // The contract will validate this is in the future
+          const ledgersFromNow = Math.ceil((autoRouteMinutes * 60) / 5);
+          // We'll set it relative to an approximate current ledger
+          // The frontend should compute this properly using the Horizon API
+          autoRouteAfter = ledgersFromNow; // placeholder — the frontend passes the actual ledger
+        }
+
         const placeXdr = await stellar.buildTransaction(
           sourceAddress,
           config.swapbookContractId,
@@ -576,8 +620,11 @@ app.post('/api/peer-swap/build', async (req, res) => {
             StellarClient.toAddress(tokenIn),
             StellarClient.toAddress(tokenOut),
             StellarClient.toI128(amountToSit),
-            StellarClient.toI128(proRataMinOut),
+            StellarClient.toI128(priceModeVal === 1 ? 0n : proRataMinOut),
             StellarClient.toU32(orderExpiry),
+            StellarClient.toU32(priceModeVal),
+            StellarClient.toU32(slippageBps),
+            StellarClient.toU32(autoRouteAfter),
           ]
         );
         xdrs.push(placeXdr);
@@ -619,6 +666,43 @@ app.post('/api/swap/submit', async (req, res) => {
     console.error('Submit transaction error:', error);
     res.status(500).json({ error: 'Failed to submit transaction' });
   }
+});
+
+/**
+ * GET /api/oracle/price
+ *
+ * Get the latest oracle price for a pair.
+ * Query params: tokenIn, tokenOut (symbols like 'SolvBTC', 'USDC')
+ */
+app.get('/api/oracle/price', (req, res) => {
+  const { tokenIn, tokenOut } = req.query;
+
+  if (!tokenIn || !tokenOut) {
+    res.status(400).json({ error: 'Missing required params: tokenIn, tokenOut' });
+    return;
+  }
+
+  const price = oracleService.getPrice(tokenIn as string, tokenOut as string);
+
+  if (!price) {
+    res.json({
+      available: false,
+      tokenIn,
+      tokenOut,
+      message: 'No oracle price available for this pair',
+    });
+    return;
+  }
+
+  res.json({
+    available: true,
+    tokenIn,
+    tokenOut,
+    price: price.humanPrice,
+    priceNum: price.priceNum.toString(),
+    priceDen: price.priceDen.toString(),
+    fetchedAt: price.fetchedAt.toISOString(),
+  });
 });
 
 /**

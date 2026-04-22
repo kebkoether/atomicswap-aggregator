@@ -90,6 +90,18 @@ export async function getUserOrders(address: string): Promise<any[]> {
   return data.orders;
 }
 
+export async function getOraclePrice(
+  tokenIn: string,
+  tokenOut: string
+): Promise<{ available: boolean; price?: number; fetchedAt?: string }> {
+  const params = new URLSearchParams({ tokenIn, tokenOut });
+  const response = await fetch(`${API_BASE}/api/oracle/price?${params}`);
+  if (!response.ok) {
+    return { available: false };
+  }
+  return response.json();
+}
+
 export async function buildPeerSwap(body: {
   sourceAddress: string;
   tokenIn: string;
@@ -97,6 +109,9 @@ export async function buildPeerSwap(body: {
   amountIn: string;
   minAmountOut: string;
   expiry?: number;
+  priceMode?: number;
+  maxSlippageBps?: number;
+  autoRouteMinutes?: number;
 }): Promise<any> {
   const response = await fetch(`${API_BASE}/api/peer-swap/build`, {
     method: 'POST',
