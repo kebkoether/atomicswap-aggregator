@@ -13,21 +13,33 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { RoutingEngine } from './router/engine.js';
 import { createVenueRegistry } from './venues/index.js';
-import { StellarClient } from './stellar/client.js';
-import { getLiveTokens, resolveToken, formatAmount } from './stellar/tokens.js';
+import { StellarClient, scEnum } from './stellar/client.js';
+import { TOKENS, resolveSacAddress } from './stellar/tokens.js';
 import { OraclePriceService } from './services/oracle.js';
 import { TimerSweepService } from './services/timer-sweep.js';
 
 const app = express();
+app.use(helmet());
 app.use(cors({
   origin: process.env.CORS_ORIGIN
     ? process.env.CORS_ORIGIN.split(',')
     : ['http://localhost:3000', 'http://localhost:3001'],
   credentials: true,
 }));
-app.use(express.json());
+app.use(express.json({ limit: '100kb' }));
+app.use(
+  '/api/',
+  rateLimit({
+    windowMs: 60 * 1000,
+    limit: 120, // per IP per minute
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
 
 // ─── Configuration ──────────────────────────────────────
 
@@ -44,15 +56,65 @@ const config = {
   horizonUrl: process.env.HORIZON_URL ?? 'https://horizon-testnet.stellar.org',
 };
 
-// ─── Supported Assets ───────────────────────────────────
+/** Ledgers per second on Stellar (approx). */
+const LEDGER_SECONDS = 5;
+/** Default order lifetime if the caller doesn't pass an expiry (~7 days). */
+const DEFAULT_EXPIRY_LEDGERS = Math.floor((7 * 24 * 3600) / LEDGER_SECONDS);
 
-const SUPPORTED_ASSETS = [
-  { symbol: 'USDC', name: 'USD Coin', issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN', decimals: 7, status: 'live' },
-  { symbol: 'PYUSD', name: 'PayPal USD', issuer: 'GDQE7IXJ4HUHV6RQHIUPRJSEZE4DRS5WY577O2FY6YQ5LVWZ7JZTU2V5', decimals: 7, status: 'live' },
-  { symbol: 'USDY', name: 'Ondo US Dollar Yield', issuer: '', decimals: 7, status: 'live' },
-  { symbol: 'USDT0', name: 'Tether USD', issuer: '', decimals: 7, status: 'coming_soon' },
-  { symbol: 'SolvBTC', name: 'Solv BTC', issuer: '', decimals: 7, status: 'live' },
-];
+// ─── Input validation helpers ───────────────────────────
+
+class BadRequest extends Error {}
+
+function parseAmount(value: unknown, field: string): bigint {
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    throw new BadRequest(`${field} is required`);
+  }
+  let parsed: bigint;
+  try {
+    parsed = BigInt(value);
+  } catch {
+    throw new BadRequest(`${field} must be an integer amount in base units`);
+  }
+  if (parsed <= 0n) throw new BadRequest(`${field} must be positive`);
+  if (parsed > 10n ** 26n) throw new BadRequest(`${field} is implausibly large`);
+  return parsed;
+}
+
+function parseSlippageBps(value: unknown, fallback = 50): number {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1 || n > 1000) {
+    throw new BadRequest('slippage must be an integer between 1 and 1000 bps');
+  }
+  return n;
+}
+
+function parseStellarAccount(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !/^G[A-Z2-7]{55}$/.test(value)) {
+    throw new BadRequest(`${field} must be a Stellar account address`);
+  }
+  return value;
+}
+
+function resolveTokenParam(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new BadRequest(`${field} is required`);
+  }
+  try {
+    return resolveSacAddress(value);
+  } catch (err) {
+    throw new BadRequest((err as Error).message);
+  }
+}
+
+function handleError(res: express.Response, error: unknown, label: string): void {
+  if (error instanceof BadRequest) {
+    res.status(400).json({ error: error.message });
+    return;
+  }
+  console.error(`${label}:`, error);
+  res.status(500).json({ error: label });
+}
 
 // ─── Initialize Services ────────────────────────────────
 
@@ -93,17 +155,96 @@ const oracleService = new OraclePriceService({
   stellar,
   swapbookContractId: config.swapbookContractId,
   intervalMs: 5 * 60 * 1000, // 5 minutes
+  oracleSecretKey: process.env.ORACLE_SECRET_KEY,
 });
 oracleService.start();
 
 const timerSweep = new TimerSweepService({
   stellar,
   swapbookContractId: config.swapbookContractId,
+  routerContractId: config.routerContractId,
   routingEngine,
   intervalMs: 60 * 1000, // 60 seconds
-  dryRun: !process.env.ADMIN_SECRET_KEY, // dry run if no admin key
+  keeperSecretKey: process.env.KEEPER_SECRET_KEY ?? process.env.ADMIN_SECRET_KEY,
 });
 timerSweep.start();
+
+// ─── Shared order helpers ───────────────────────────────
+
+interface ChainOrder {
+  id: number;
+  maker: string;
+  status: string;
+  amountIn: bigint;
+  amountInRemaining: bigint;
+  minAmountOut: bigint;
+  expiry: number;
+  priceMode: string;
+  raw: any;
+}
+
+function normalizeOrder(raw: any): ChainOrder | null {
+  if (!raw) return null;
+  try {
+    return {
+      id: Number(raw.id),
+      maker: String(raw.maker),
+      status: scEnum(raw.status),
+      amountIn: BigInt(raw.amount_in ?? 0),
+      amountInRemaining: BigInt(raw.amount_in_remaining ?? 0),
+      minAmountOut: BigInt(raw.min_amount_out ?? 0),
+      expiry: Number(raw.expiry ?? 0),
+      priceMode: scEnum(raw.price_mode),
+      raw,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isOpen(order: ChainOrder): boolean {
+  return order.status === 'Open' || order.status === 'PartialFill';
+}
+
+async function fetchOrdersForPair(
+  tokenInSac: string,
+  tokenOutSac: string
+): Promise<ChainOrder[]> {
+  const orderIds = await stellar.simulateAndParse<Array<number | bigint>>(
+    config.swapbookContractId,
+    'get_orders',
+    [StellarClient.toAddress(tokenInSac), StellarClient.toAddress(tokenOutSac)]
+  );
+  if (!orderIds || orderIds.length === 0) return [];
+
+  const orders = await Promise.all(
+    orderIds.map((id) =>
+      stellar.simulateAndParse<any>(config.swapbookContractId, 'get_order', [
+        StellarClient.toU64(BigInt(id)),
+      ])
+    )
+  );
+  return orders.map(normalizeOrder).filter((o): o is ChainOrder => o !== null);
+}
+
+function orderToJson(order: ChainOrder, extra: Record<string, unknown> = {}) {
+  return {
+    id: order.id,
+    maker: order.maker,
+    status: order.status,
+    amountIn: order.amountIn.toString(),
+    amountInRemaining: order.amountInRemaining.toString(),
+    minAmountOut: order.minAmountOut.toString(),
+    expiry: order.expiry,
+    priceMode: order.priceMode,
+    ...extra,
+  };
+}
+
+/** ceil(a * b / d) for bigints — mirrors the contract's rounding. */
+function muldivCeil(a: bigint, b: bigint, d: bigint): bigint {
+  return (a * b + d - 1n) / d;
+}
 
 // ─── API Routes ─────────────────────────────────────────
 
@@ -111,7 +252,16 @@ timerSweep.start();
  * GET /api/assets
  */
 app.get('/api/assets', (_req, res) => {
-  res.json({ assets: SUPPORTED_ASSETS });
+  res.json({
+    assets: Object.values(TOKENS).map((t) => ({
+      symbol: t.symbol,
+      name: t.name,
+      issuer: t.issuer,
+      sacAddress: t.sacAddress,
+      decimals: t.decimals,
+      status: t.status,
+    })),
+  });
 });
 
 /**
@@ -125,21 +275,12 @@ app.get('/api/assets', (_req, res) => {
  */
 app.get('/api/quote', async (req, res) => {
   try {
-    const { tokenIn, tokenOut, amountIn, slippage } = req.query;
+    const tokenIn = resolveTokenParam(req.query.tokenIn, 'tokenIn');
+    const tokenOut = resolveTokenParam(req.query.tokenOut, 'tokenOut');
+    const amountIn = parseAmount(req.query.amountIn, 'amountIn');
+    const slippage = parseSlippageBps(req.query.slippage);
 
-    if (!tokenIn || !tokenOut || !amountIn) {
-      res.status(400).json({ error: 'Missing required params: tokenIn, tokenOut, amountIn' });
-      return;
-    }
-
-    console.log(`Quote request: ${amountIn} ${tokenIn} -> ${tokenOut}`);
-
-    const route = await routingEngine.computeRoute(
-      tokenIn as string,
-      tokenOut as string,
-      BigInt(amountIn as string),
-      slippage ? parseInt(slippage as string) : undefined
-    );
+    const route = await routingEngine.computeRoute(tokenIn, tokenOut, amountIn, slippage);
 
     res.json({
       tokenIn: route.tokenIn,
@@ -165,8 +306,7 @@ app.get('/api/quote', async (req, res) => {
       })),
     });
   } catch (error) {
-    console.error('Quote error:', error);
-    res.status(500).json({ error: 'Failed to compute route' });
+    handleError(res, error, 'Failed to compute route');
   }
 });
 
@@ -175,44 +315,13 @@ app.get('/api/quote', async (req, res) => {
  */
 app.get('/api/orders', async (req, res) => {
   try {
-    const { tokenIn, tokenOut } = req.query;
+    const tokenIn = resolveTokenParam(req.query.tokenIn, 'tokenIn');
+    const tokenOut = resolveTokenParam(req.query.tokenOut, 'tokenOut');
 
-    if (!tokenIn || !tokenOut) {
-      res.status(400).json({ error: 'Missing required params: tokenIn, tokenOut' });
-      return;
-    }
-
-    // Query SwapBook for open order IDs
-    const orderIds = await stellar.simulateAndParse<number[]>(
-      config.swapbookContractId,
-      'get_orders',
-      [
-        StellarClient.toAddress(tokenIn as string),
-        StellarClient.toAddress(tokenOut as string),
-      ]
-    );
-
-    if (!orderIds || orderIds.length === 0) {
-      res.json({ orders: [] });
-      return;
-    }
-
-    // Fetch each order's details
-    const orders = await Promise.all(
-      orderIds.map(async (id) => {
-        const order = await stellar.simulateAndParse<any>(
-          config.swapbookContractId,
-          'get_order',
-          [StellarClient.toU64(id)]
-        );
-        return order;
-      })
-    );
-
-    res.json({ orders: orders.filter(Boolean) });
+    const orders = await fetchOrdersForPair(tokenIn, tokenOut);
+    res.json({ orders: orders.filter(isOpen).map((o) => orderToJson(o)) });
   } catch (error) {
-    console.error('Orders query error:', error);
-    res.status(500).json({ error: 'Failed to fetch orders' });
+    handleError(res, error, 'Failed to fetch orders');
   }
 });
 
@@ -224,54 +333,31 @@ app.get('/api/orders', async (req, res) => {
  */
 app.get('/api/orders/user/:address', async (req, res) => {
   try {
-    const userAddress = req.params.address;
-    const liveAssets = SUPPORTED_ASSETS.filter((a) => a.status === 'live');
+    const userAddress = parseStellarAccount(req.params.address, 'address');
+    const liveTokens = Object.values(TOKENS).filter(
+      (t) => t.status === 'live' && t.sacAddress
+    );
 
-    // Build all pair permutations
-    const pairs: Array<{ symbolIn: string; symbolOut: string }> = [];
-    for (const a of liveAssets) {
-      for (const b of liveAssets) {
-        if (a.symbol !== b.symbol) {
-          pairs.push({ symbolIn: a.symbol, symbolOut: b.symbol });
-        }
+    const pairs: Array<{ in: (typeof liveTokens)[number]; out: (typeof liveTokens)[number] }> = [];
+    for (const a of liveTokens) {
+      for (const b of liveTokens) {
+        if (a.symbol !== b.symbol) pairs.push({ in: a, out: b });
       }
     }
 
-    // Query each pair for order IDs, then fetch details, filter by maker
     const allOrders: any[] = [];
-
     await Promise.all(
       pairs.map(async (pair) => {
         try {
-          const orderIds = await stellar.simulateAndParse<number[]>(
-            config.swapbookContractId,
-            'get_orders',
-            [
-              StellarClient.toAddress(pair.symbolIn),
-              StellarClient.toAddress(pair.symbolOut),
-            ]
-          );
-
-          if (!orderIds || orderIds.length === 0) return;
-
-          const orders = await Promise.all(
-            orderIds.map(async (id) => {
-              const order = await stellar.simulateAndParse<any>(
-                config.swapbookContractId,
-                'get_order',
-                [StellarClient.toU64(id)]
-              );
-              return order;
-            })
-          );
-
+          const orders = await fetchOrdersForPair(pair.in.sacAddress, pair.out.sacAddress);
           for (const order of orders) {
-            if (order && order.maker === userAddress) {
-              allOrders.push({
-                ...order,
-                tokenInSymbol: pair.symbolIn,
-                tokenOutSymbol: pair.symbolOut,
-              });
+            if (order.maker === userAddress && isOpen(order)) {
+              allOrders.push(
+                orderToJson(order, {
+                  tokenInSymbol: pair.in.symbol,
+                  tokenOutSymbol: pair.out.symbol,
+                })
+              );
             }
           }
         } catch {
@@ -282,15 +368,15 @@ app.get('/api/orders/user/:address', async (req, res) => {
 
     res.json({ orders: allOrders });
   } catch (error) {
-    console.error('User orders query error:', error);
-    res.status(500).json({ error: 'Failed to fetch user orders' });
+    handleError(res, error, 'Failed to fetch user orders');
   }
 });
 
 /**
  * POST /api/orders/cancel
  *
- * Build an unsigned cancel_order transaction.
+ * Build an unsigned cancel_order transaction. The maker's wallet signature
+ * is what authorizes the cancel on-chain (order.maker.require_auth).
  *
  * Body:
  *   sourceAddress - User's Stellar address (must be the maker)
@@ -298,58 +384,62 @@ app.get('/api/orders/user/:address', async (req, res) => {
  */
 app.post('/api/orders/cancel', async (req, res) => {
   try {
-    const { sourceAddress, orderId } = req.body;
-
-    if (!sourceAddress || orderId === undefined) {
-      res.status(400).json({ error: 'Missing required fields: sourceAddress, orderId' });
-      return;
+    const sourceAddress = parseStellarAccount(req.body.sourceAddress, 'sourceAddress');
+    const orderId = Number(req.body.orderId);
+    if (!Number.isInteger(orderId) || orderId < 1) {
+      throw new BadRequest('orderId must be a positive integer');
     }
 
     const xdr = await stellar.buildTransaction(
       sourceAddress,
       config.swapbookContractId,
       'cancel_order',
-      [
-        StellarClient.toAddress(sourceAddress),
-        StellarClient.toU64(orderId),
-      ]
+      [StellarClient.toU64(orderId)]
     );
 
     res.json({ xdr });
   } catch (error) {
-    console.error('Cancel order error:', error);
-    res.status(500).json({ error: 'Failed to build cancel transaction' });
+    handleError(res, error, 'Failed to build cancel transaction');
   }
 });
 
 /**
  * POST /api/swap/build
- * Build an unsigned transaction for a routed swap.
+ * Build an unsigned Router.execute_route transaction for an instant swap.
+ *
+ * Only Router-executable venues (DEX adapters) are used for the on-chain
+ * route. P2P book liquidity is accessed via /api/peer-swap/build instead.
  *
  * Body:
  *   sourceAddress - User's Stellar address
- *   tokenIn, tokenOut - SAC addresses
+ *   tokenIn, tokenOut - SAC addresses or symbols
  *   amountIn - Base units
- *   slippage - bps
+ *   slippage - bps (default 50)
  */
 app.post('/api/swap/build', async (req, res) => {
   try {
-    const { sourceAddress, tokenIn, tokenOut, amountIn, slippage } = req.body;
+    const sourceAddress = parseStellarAccount(req.body.sourceAddress, 'sourceAddress');
+    const tokenIn = resolveTokenParam(req.body.tokenIn, 'tokenIn');
+    const tokenOut = resolveTokenParam(req.body.tokenOut, 'tokenOut');
+    const amountIn = parseAmount(req.body.amountIn, 'amountIn');
+    const slippage = parseSlippageBps(req.body.slippage);
 
-    if (!sourceAddress || !tokenIn || !tokenOut || !amountIn) {
-      res.status(400).json({ error: 'Missing required fields' });
-      return;
+    // Route across venues the Router contract can actually execute
+    const route = await routingEngine.computeRoute(tokenIn, tokenOut, amountIn, slippage, {
+      executableOnly: true,
+    });
+
+    if (route.instructions.length === 0) {
+      throw new BadRequest('No executable venue liquidity for this pair');
     }
 
-    // Compute route
-    const route = await routingEngine.computeRoute(
-      tokenIn,
-      tokenOut,
-      BigInt(amountIn),
-      slippage ?? 50
-    );
+    // min_total_out: expected net output with slippage tolerance applied
+    const minTotalOut =
+      (route.netAmountOut * BigInt(10000 - slippage)) / 10000n;
+    if (minTotalOut <= 0n) {
+      throw new BadRequest('Route output too small');
+    }
 
-    // Build the Router.execute_route transaction
     const xdr = await stellar.buildTransaction(
       sourceAddress,
       config.routerContractId,
@@ -359,9 +449,14 @@ app.post('/api/swap/build', async (req, res) => {
         StellarClient.toAddress(tokenIn),
         StellarClient.toAddress(tokenOut),
         StellarClient.toI128(route.totalAmountIn),
-        StellarClient.toI128(route.netAmountOut), // min_total_out
-        // segments would need to be encoded as a Vec<RouteSegment> ScVal
-        // This is complex — for now we return the route for frontend encoding
+        StellarClient.toI128(minTotalOut),
+        StellarClient.toRouteSegments(
+          route.instructions.map((i) => ({
+            venueId: i.venueId,
+            amountIn: i.amountIn,
+            minAmountOut: i.minAmountOut,
+          }))
+        ),
       ]
     );
 
@@ -370,6 +465,7 @@ app.post('/api/swap/build', async (req, res) => {
       route: {
         totalAmountIn: route.totalAmountIn.toString(),
         netAmountOut: route.netAmountOut.toString(),
+        minTotalOut: minTotalOut.toString(),
         blendedBps: route.blendedBps,
         segments: route.segments.map((s) => ({
           venue: s.venueName,
@@ -380,21 +476,21 @@ app.post('/api/swap/build', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Build swap error:', error);
-    res.status(500).json({ error: 'Failed to build transaction' });
+    handleError(res, error, 'Failed to build transaction');
   }
 });
 
 /**
  * POST /api/peer-swap/build
  *
- * Build a Peer Swap transaction. This:
+ * Build a Peer Swap plan. This:
  *   1. Checks for matching orders on the reverse side (tokenOut → tokenIn)
- *   2. If matches exist, fills them (partial or full)
+ *   2. If matches exist, builds fill transactions (partial or full)
  *   3. Any remaining amount gets placed as a new sitting order
  *
- * All steps are bundled into one Stellar transaction so they
- * execute atomically on-chain.
+ * NOTE: these are returned as separate transactions the wallet signs in
+ * sequence — the book can move between them. Collapsing them into one
+ * multi-op transaction is tracked as follow-up work.
  *
  * Body:
  *   sourceAddress    - User's Stellar address
@@ -402,244 +498,161 @@ app.post('/api/swap/build', async (req, res) => {
  *   tokenOut         - Token being bought (symbol or SAC address)
  *   amountIn         - Amount to sell (base units, 7 decimals)
  *   minAmountOut     - Minimum acceptable output (base units). Required for Fixed mode.
- *   expiry           - Ledger sequence at which unfilled remainder expires
+ *   expiry           - Ledger sequence at which unfilled remainder expires (optional)
  *   priceMode        - 0 = Fixed (default), 1 = Oracle (market price)
  *   maxSlippageBps   - Max slippage for Oracle mode (default: 50 = 0.50%)
  *   autoRouteMinutes - Minutes to sit on P2P book before auto-routing via DEXs.
- *                      0 = no auto-route (default). Converted to ledger sequences.
  */
 app.post('/api/peer-swap/build', async (req, res) => {
   try {
-    const {
-      sourceAddress, tokenIn, tokenOut, amountIn, minAmountOut, expiry,
-      priceMode, maxSlippageBps, autoRouteMinutes,
-    } = req.body;
-
-    if (!sourceAddress || !tokenIn || !tokenOut || !amountIn || !minAmountOut) {
-      res.status(400).json({ error: 'Missing required fields: sourceAddress, tokenIn, tokenOut, amountIn, minAmountOut' });
-      return;
+    const sourceAddress = parseStellarAccount(req.body.sourceAddress, 'sourceAddress');
+    const tokenIn = resolveTokenParam(req.body.tokenIn, 'tokenIn');
+    const tokenOut = resolveTokenParam(req.body.tokenOut, 'tokenOut');
+    const amountInBig = parseAmount(req.body.amountIn, 'amountIn');
+    const minOutBig = parseAmount(req.body.minAmountOut, 'minAmountOut');
+    const priceModeVal = req.body.priceMode === 1 ? 1 : 0;
+    const slippageBps = parseSlippageBps(req.body.maxSlippageBps);
+    const autoRouteMinutes = Number(req.body.autoRouteMinutes ?? 0);
+    if (!Number.isFinite(autoRouteMinutes) || autoRouteMinutes < 0) {
+      throw new BadRequest('autoRouteMinutes must be a non-negative number');
     }
 
-    const amountInBig = BigInt(amountIn);
-    const minOutBig = BigInt(minAmountOut);
-
-    // 1. Check reverse pair for sitting orders
-    //    Someone selling tokenOut for tokenIn = a match for us
-    const reverseOrderIds = await stellar.simulateAndParse<number[]>(
-      config.swapbookContractId,
-      'get_orders',
-      [
-        StellarClient.toAddress(tokenOut as string),
-        StellarClient.toAddress(tokenIn as string),
-      ]
+    // 1. Reverse-side sitting orders are our matches
+    const reverseOrders = (await fetchOrdersForPair(tokenOut, tokenIn)).filter(
+      (o) => isOpen(o) && o.priceMode === 'Fixed' && o.amountIn > 0n
     );
 
-    interface MatchableOrder {
-      id: number;
-      amountInRemaining: bigint;
-      minAmountOut: bigint;
-      amountIn: bigint;
-    }
-
-    const matchableOrders: MatchableOrder[] = [];
-    let totalFillable = 0n;
-
-    if (reverseOrderIds && reverseOrderIds.length > 0) {
-      // Fetch each reverse order's details
-      for (const orderId of reverseOrderIds) {
-        const order = await stellar.simulateAndParse<any>(
-          config.swapbookContractId,
-          'get_order',
-          [StellarClient.toU64(orderId)]
-        );
-
-        if (order && (order.status === 'Open' || order.status === 'PartialFill')) {
-          // This order is selling tokenOut, wanting tokenIn
-          // Their amountInRemaining = how much tokenOut they're selling
-          // Their minAmountOut (pro-rata) = how much tokenIn they want
-          const remaining = BigInt(order.amount_in_remaining ?? order.amountInRemaining ?? '0');
-          const totalMinOut = BigInt(order.min_amount_out ?? order.minAmountOut ?? '0');
-          const totalIn = BigInt(order.amount_in ?? order.amountIn ?? '0');
-
-          if (remaining > 0n && totalIn > 0n) {
-            matchableOrders.push({
-              id: orderId,
-              amountInRemaining: remaining,
-              minAmountOut: totalMinOut,
-              amountIn: totalIn,
-            });
-            totalFillable += remaining; // total tokenOut available from reverse orders
-          }
-        }
-      }
-    }
-
-    // 2. Determine how much we can fill vs how much sits
-    let amountToFill = amountInBig; // how much of our tokenIn we can use to fill reverse orders
-    let amountToSit = 0n;          // remainder that becomes a new order
-
-    // Each reverse order wants tokenIn. We need to check if we have enough
-    // tokenIn to satisfy their pro-rata min_amount_out.
+    // 2. Greedy fill planning (ceiling payments — mirrors contract rounding)
+    let budget = amountInBig;
     const fills: Array<{
       orderId: number;
-      fillAmountIn: bigint;   // how much of the reverse order's tokenOut we take
-      paymentOut: bigint;     // how much of our tokenIn we pay
+      fillAmountIn: bigint; // how much of the reverse order's token we take
+      paymentOut: bigint;   // how much of our tokenIn we pay
+      full: boolean;
     }> = [];
 
-    for (const order of matchableOrders) {
-      if (amountToFill <= 0n) break;
+    for (const order of reverseOrders) {
+      if (budget <= 0n) break;
+      const remaining = order.amountInRemaining;
+      if (remaining <= 0n) continue;
 
-      // Pro-rata: this reverse order wants (minAmountOut * remaining / totalIn) of tokenIn
-      const proRataMinOut = (order.minAmountOut * order.amountInRemaining) / order.amountIn;
+      // Full-fill cost for the remaining amount (ceil pro-rata)
+      const fullCost = muldivCeil(order.minAmountOut, remaining, order.amountIn);
 
-      if (amountToFill >= proRataMinOut) {
-        // We can satisfy this entire order
-        fills.push({
-          orderId: order.id,
-          fillAmountIn: order.amountInRemaining,
-          paymentOut: proRataMinOut,
-        });
-        amountToFill -= proRataMinOut;
+      if (budget >= fullCost) {
+        fills.push({ orderId: order.id, fillAmountIn: remaining, paymentOut: fullCost, full: true });
+        budget -= fullCost;
       } else {
-        // Partial fill: we can only afford part of this order
-        // How much of their tokenOut can we get with our remaining tokenIn?
-        const fillableFromOrder = (amountToFill * order.amountIn) / order.minAmountOut;
-        if (fillableFromOrder > 0n) {
-          fills.push({
-            orderId: order.id,
-            fillAmountIn: fillableFromOrder > order.amountInRemaining ? order.amountInRemaining : fillableFromOrder,
-            paymentOut: amountToFill,
-          });
-          amountToFill = 0n;
+        // Partial: how much can our budget buy at this order's rate?
+        let fillable = (budget * order.amountIn) / order.minAmountOut;
+        if (fillable > remaining) fillable = remaining;
+        while (fillable > 0n) {
+          const cost = muldivCeil(order.minAmountOut, fillable, order.amountIn);
+          if (cost <= budget) {
+            fills.push({ orderId: order.id, fillAmountIn: fillable, paymentOut: cost, full: false });
+            budget -= cost;
+            break;
+          }
+          fillable -= 1n;
         }
       }
     }
 
-    amountToSit = amountToFill; // whatever couldn't be matched
+    const amountToSit = budget;
+    const totalBought = fills.reduce((s, f) => s + f.fillAmountIn, 0n);
+    const totalPaid = fills.reduce((s, f) => s + f.paymentOut, 0n);
 
-    // 3. Calculate output summary
-    const totalTokenOutFromFills = fills.reduce((sum, f) => sum + f.fillAmountIn, 0n);
-    const totalTokenInUsedForFills = fills.reduce((sum, f) => sum + f.paymentOut, 0n);
-
-    console.log(`Peer Swap: ${amountIn} ${tokenIn} -> ${tokenOut}`);
-    console.log(`  Matching reverse orders: ${matchableOrders.length}`);
-    console.log(`  Instant fills: ${fills.length} (${totalTokenOutFromFills} ${tokenOut} received for ${totalTokenInUsedForFills} ${tokenIn})`);
-    console.log(`  Remainder to sit: ${amountToSit} ${tokenIn}`);
-
-    // 4. Build the multi-operation transaction
-    //    In Soroban, each contract call is a separate operation.
-    //    The transaction contains: fill ops (if any) + place_order op (if remainder)
-    //
-    //    For now, we return the plan so the frontend can build it.
-    //    (Building multi-op Soroban txns requires careful auth handling)
-
-    const plan = {
-      tokenIn,
-      tokenOut,
-      totalAmountIn: amountInBig.toString(),
-      fills: fills.map((f) => ({
-        orderId: f.orderId,
-        youReceive: f.fillAmountIn.toString(),
-        youPay: f.paymentOut.toString(),
-        feesBps: 0.5,
-      })),
-      remainder: amountToSit > 0n ? {
-        amountIn: amountToSit.toString(),
-        minAmountOut: ((minOutBig * amountToSit) / amountInBig).toString(),
-        expiry: expiry ?? null,
-        status: 'will_escrow',
-      } : null,
-      summary: {
-        instantFillAmount: totalTokenOutFromFills.toString(),
-        instantFillCostBps: 0.5,
-        escrowedAmount: amountToSit.toString(),
-        totalTokenOutReceived: totalTokenOutFromFills.toString(),
-      },
-    };
-
-    // If we can build a transaction, build it
-    // For now, we return the plan + individual XDRs
+    // 3. Build transactions
     const xdrs: string[] = [];
-
-    // Build fill transactions
     for (const fill of fills) {
+      const method = fill.full ? 'fill_order' : 'partial_fill';
+      const args = fill.full
+        ? [
+            StellarClient.toAddress(sourceAddress),
+            StellarClient.toU64(fill.orderId),
+            StellarClient.toI128(fill.paymentOut),
+          ]
+        : [
+            StellarClient.toAddress(sourceAddress),
+            StellarClient.toU64(fill.orderId),
+            StellarClient.toI128(fill.fillAmountIn),
+            StellarClient.toI128(fill.paymentOut),
+          ];
       try {
-        const fillXdr = await stellar.buildTransaction(
-          sourceAddress,
-          config.swapbookContractId,
-          fill.fillAmountIn === matchableOrders.find(o => o.id === fill.orderId)!.amountInRemaining
-            ? 'fill_order'
-            : 'partial_fill',
-          fill.fillAmountIn === matchableOrders.find(o => o.id === fill.orderId)!.amountInRemaining
-            ? [
-                StellarClient.toAddress(sourceAddress),
-                StellarClient.toU64(fill.orderId),
-                StellarClient.toI128(fill.paymentOut),
-              ]
-            : [
-                StellarClient.toAddress(sourceAddress),
-                StellarClient.toU64(fill.orderId),
-                StellarClient.toI128(fill.fillAmountIn),
-                StellarClient.toI128(fill.paymentOut),
-              ]
+        xdrs.push(
+          await stellar.buildTransaction(
+            sourceAddress,
+            config.swapbookContractId,
+            method,
+            args
+          )
         );
-        xdrs.push(fillXdr);
       } catch (err) {
         console.warn(`Could not build fill tx for order ${fill.orderId}:`, err);
       }
     }
 
-    // Build place_order for remainder
+    let remainderPlan: Record<string, unknown> | null = null;
     if (amountToSit > 0n) {
-      try {
-        const proRataMinOut = (minOutBig * amountToSit) / amountInBig;
-        const orderExpiry = expiry ?? 1_000_000; // ~46 days at 5s/ledger
+      const currentLedger = await stellar.getLatestLedger();
+      const orderExpiry = Number.isInteger(req.body.expiry) && req.body.expiry > currentLedger
+        ? Number(req.body.expiry)
+        : currentLedger + DEFAULT_EXPIRY_LEDGERS;
+      const autoRouteAfter =
+        autoRouteMinutes > 0
+          ? currentLedger + Math.ceil((autoRouteMinutes * 60) / LEDGER_SECONDS)
+          : 0;
+      // Pro-rata min for the sitting remainder (round up — protects the maker)
+      const proRataMinOut = muldivCeil(minOutBig, amountToSit, amountInBig);
 
-        // Price mode: 0 = Fixed, 1 = Oracle
-        const priceModeVal = priceMode ?? 0;
-        const slippageBps = maxSlippageBps ?? 50;
-
-        // Convert autoRouteMinutes to ledger sequences (1 ledger ≈ 5 seconds)
-        // autoRouteAfter = current_ledger + (minutes * 60 / 5)
-        let autoRouteAfter = 0;
-        if (autoRouteMinutes && autoRouteMinutes > 0) {
-          // We estimate current ledger from the order expiry or use a sensible offset
-          // The contract will validate this is in the future
-          const ledgersFromNow = Math.ceil((autoRouteMinutes * 60) / 5);
-          // We'll set it relative to an approximate current ledger
-          // The frontend should compute this properly using the Horizon API
-          autoRouteAfter = ledgersFromNow; // placeholder — the frontend passes the actual ledger
-        }
-
-        const placeXdr = await stellar.buildTransaction(
-          sourceAddress,
-          config.swapbookContractId,
-          'place_order',
-          [
-            StellarClient.toAddress(sourceAddress),
-            StellarClient.toAddress(tokenIn),
-            StellarClient.toAddress(tokenOut),
-            StellarClient.toI128(amountToSit),
-            StellarClient.toI128(priceModeVal === 1 ? 0n : proRataMinOut),
-            StellarClient.toU32(orderExpiry),
-            StellarClient.toU32(priceModeVal),
-            StellarClient.toU32(slippageBps),
-            StellarClient.toU32(autoRouteAfter),
-          ]
-        );
-        xdrs.push(placeXdr);
-      } catch (err) {
-        console.warn('Could not build place_order tx:', err);
-      }
+      const placeXdr = await stellar.buildTransaction(
+        sourceAddress,
+        config.swapbookContractId,
+        'place_order',
+        [
+          StellarClient.toAddress(sourceAddress),
+          StellarClient.toAddress(tokenIn),
+          StellarClient.toAddress(tokenOut),
+          StellarClient.toI128(amountToSit),
+          StellarClient.toI128(priceModeVal === 1 ? 0n : proRataMinOut),
+          StellarClient.toU32(orderExpiry),
+          StellarClient.toU32(priceModeVal),
+          StellarClient.toU32(priceModeVal === 1 ? slippageBps : 0),
+          StellarClient.toU32(autoRouteAfter),
+        ]
+      );
+      xdrs.push(placeXdr);
+      remainderPlan = {
+        amountIn: amountToSit.toString(),
+        minAmountOut: proRataMinOut.toString(),
+        expiry: orderExpiry,
+        autoRouteAfter,
+        status: 'will_escrow',
+      };
     }
 
     res.json({
-      plan,
-      xdrs, // Array of transaction XDRs to sign and submit in order
+      plan: {
+        tokenIn,
+        tokenOut,
+        totalAmountIn: amountInBig.toString(),
+        fills: fills.map((f) => ({
+          orderId: f.orderId,
+          youReceive: f.fillAmountIn.toString(),
+          youPay: f.paymentOut.toString(),
+          feesBps: 0.5,
+        })),
+        remainder: remainderPlan,
+        summary: {
+          instantFillAmount: totalBought.toString(),
+          instantFillCost: totalPaid.toString(),
+          escrowedAmount: amountToSit.toString(),
+        },
+      },
+      xdrs, // Transactions to sign and submit in order
     });
   } catch (error) {
-    console.error('Peer swap error:', error);
-    res.status(500).json({ error: 'Failed to build peer swap' });
+    handleError(res, error, 'Failed to build peer swap');
   }
 });
 
@@ -647,32 +660,25 @@ app.post('/api/peer-swap/build', async (req, res) => {
  * POST /api/swap/submit
  *
  * Submit a signed transaction XDR to the Stellar network.
- *
- * Body:
- *   signedXdr - The signed transaction XDR string
  */
 app.post('/api/swap/submit', async (req, res) => {
   try {
     const { signedXdr } = req.body;
-
-    if (!signedXdr) {
-      res.status(400).json({ error: 'Missing required field: signedXdr' });
-      return;
+    if (typeof signedXdr !== 'string' || signedXdr.length === 0 || signedXdr.length > 100_000) {
+      throw new BadRequest('signedXdr must be a transaction XDR string');
     }
 
     const result = await stellar.submitTransaction(signedXdr);
     res.json({ status: result.status, result });
   } catch (error) {
-    console.error('Submit transaction error:', error);
-    res.status(500).json({ error: 'Failed to submit transaction' });
+    handleError(res, error, 'Failed to submit transaction');
   }
 });
 
 /**
  * GET /api/oracle/price
  *
- * Get the latest oracle price for a pair.
- * Query params: tokenIn, tokenOut (symbols like 'SolvBTC', 'USDC')
+ * Get the latest oracle price for a pair (symbols like 'SolvBTC', 'USDC').
  */
 app.get('/api/oracle/price', (req, res) => {
   const { tokenIn, tokenOut } = req.query;
@@ -712,7 +718,7 @@ app.get('/api/health', async (_req, res) => {
   const venues = await registry.getAvailable();
   res.json({
     status: 'ok',
-    venues: venues.map((v) => v.name),
+    venues: venues.map((v) => ({ name: v.name, executable: v.executable })),
     contracts: {
       swapbook: config.swapbookContractId,
       router: config.routerContractId,

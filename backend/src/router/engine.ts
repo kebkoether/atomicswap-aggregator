@@ -89,15 +89,23 @@ export class RoutingEngine {
    * @param tokenOut - SAC address of output token
    * @param amountIn - Total amount to swap (7 decimal places)
    * @param slippageBps - Maximum acceptable slippage in basis points
+   * @param opts.executableOnly - Restrict to venues the on-chain Router can
+   *   execute (required when the route becomes execute_route /
+   *   route_expired_order segments). Quote-only callers may include all
+   *   venues for display.
    */
   async computeRoute(
     tokenIn: string,
     tokenOut: string,
     amountIn: bigint,
-    slippageBps: number = 50 // default 0.5% slippage tolerance
+    slippageBps: number = 50, // default 0.5% slippage tolerance
+    opts: { executableOnly?: boolean } = {}
   ): Promise<Route> {
     // 1. Get all available venues
-    const venues = await this.registry.getAvailable();
+    let venues = await this.registry.getAvailable();
+    if (opts.executableOnly) {
+      venues = venues.filter((v) => v.executable);
+    }
 
     if (venues.length === 0) {
       throw new Error('No venues available');
@@ -131,13 +139,16 @@ export class RoutingEngine {
       0n
     );
 
-    // Protocol fee (0.5 bps) is ONLY charged on the SwapBook portion.
-    // DEX venues pass through at cost — no markup.
+    // Protocol fee (0.5 bps) is charged on the TOTAL output, rounded up —
+    // this must mirror the Router contract's calculate_fee exactly, or
+    // min_total_out will be set above what the user can ever receive.
     const swapBookOut = segments
       .filter((s) => s.venueName === 'SwapBook')
       .reduce((sum, s) => sum + s.expectedAmountOut, 0n);
     const protocolFee =
-      (swapBookOut * FEE_NUMERATOR) / FEE_DENOMINATOR;
+      totalExpectedOut > 0n
+        ? (totalExpectedOut * FEE_NUMERATOR + FEE_DENOMINATOR - 1n) / FEE_DENOMINATOR
+        : 0n;
     const netAmountOut = totalExpectedOut - protocolFee;
 
     const blendedBps =

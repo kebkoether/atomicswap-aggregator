@@ -1,64 +1,62 @@
 /**
- * Timer Sweep Service
+ * Timer Sweep Service (keeper)
  *
  * Periodically scans the SwapBook contract for orders whose
- * auto_route_after timer has expired. When found, the router
- * claims these orders and routes the escrowed tokens through
- * available DEX liquidity on behalf of the maker.
+ * auto_route_after timer has expired, then calls the Router contract's
+ * route_expired_order — which atomically claims the escrow, executes the
+ * DEX route, enforces the maker's on-chain price floor, and pays the
+ * maker. The keeper key holds NO custody and NO special privileges:
+ * route_expired_order is permissionless and reverts on any bad route.
  *
- * Flow:
- *  1. Query all token pairs for expired-timer order IDs
- *  2. For each expired order, call claim_expired_timer (router auth)
- *  3. Route claimed tokens through the smart routing engine
- *  4. Send proceeds to the maker's address
- *
- * This service requires the ADMIN_SECRET_KEY env var to sign
- * router transactions. Without it, the sweep runs in dry-run
- * mode (logs what it would do).
+ * Without KEEPER_SECRET_KEY the sweep runs in dry-run mode (logs only).
  */
 
-import { StellarClient } from '../stellar/client.js';
+import { Keypair } from '@stellar/stellar-sdk';
+import { StellarClient, scEnum } from '../stellar/client.js';
 import { TOKENS } from '../stellar/tokens.js';
 import { RoutingEngine } from '../router/engine.js';
 
 export class TimerSweepService {
   private stellar: StellarClient;
   private swapbookContractId: string;
+  private routerContractId: string;
   private routingEngine: RoutingEngine;
   private intervalMs: number;
   private timer: ReturnType<typeof setInterval> | null = null;
-  private dryRun: boolean;
+  private keeper: InstanceType<typeof Keypair> | null = null;
+  private sweeping = false;
 
   constructor(opts: {
     stellar: StellarClient;
     swapbookContractId: string;
+    routerContractId: string;
     routingEngine: RoutingEngine;
     /** Sweep interval in milliseconds (default: 60s) */
     intervalMs?: number;
-    /** If true, log actions but don't submit transactions */
-    dryRun?: boolean;
+    /** Keeper signing key. Omit for dry-run mode. */
+    keeperSecretKey?: string;
   }) {
     this.stellar = opts.stellar;
     this.swapbookContractId = opts.swapbookContractId;
+    this.routerContractId = opts.routerContractId;
     this.routingEngine = opts.routingEngine;
     this.intervalMs = opts.intervalMs ?? 60 * 1000;
-    this.dryRun = opts.dryRun ?? true;
+    if (opts.keeperSecretKey) {
+      try {
+        this.keeper = Keypair.fromSecret(opts.keeperSecretKey);
+      } catch {
+        console.error('[TimerSweep] keeper secret is not a valid Stellar key — dry-run mode');
+      }
+    }
   }
 
   start(): void {
     console.log('[TimerSweep] Starting timer sweep service');
     console.log(`[TimerSweep] Sweep interval: ${this.intervalMs / 1000}s`);
-    console.log(`[TimerSweep] Mode: ${this.dryRun ? 'DRY RUN (no admin key)' : 'LIVE'}`);
+    console.log(`[TimerSweep] Mode: ${this.keeper ? 'LIVE (keeper)' : 'DRY RUN (no keeper key)'}`);
 
-    // Run immediately, then on interval
-    this.sweep().catch((err) =>
-      console.error('[TimerSweep] Initial sweep failed:', err)
-    );
-    this.timer = setInterval(() => {
-      this.sweep().catch((err) =>
-        console.error('[TimerSweep] Sweep failed:', err)
-      );
-    }, this.intervalMs);
+    this.runSweep();
+    this.timer = setInterval(() => this.runSweep(), this.intervalMs);
   }
 
   stop(): void {
@@ -69,23 +67,34 @@ export class TimerSweepService {
     }
   }
 
+  /** Guard against overlapping sweeps when a sweep outlives the interval. */
+  private runSweep(): void {
+    if (this.sweeping) return;
+    this.sweeping = true;
+    this.sweep()
+      .catch((err) => console.error('[TimerSweep] Sweep failed:', err))
+      .finally(() => {
+        this.sweeping = false;
+      });
+  }
+
   /** Run one sweep across all token pairs. */
   private async sweep(): Promise<void> {
-    const liveTokens = Object.values(TOKENS).filter((t) => t.status === 'live' && t.sacAddress);
+    if (!this.swapbookContractId || !this.routerContractId) return;
 
-    if (liveTokens.length < 2) {
-      // Not enough configured tokens to form pairs
-      return;
-    }
+    const liveTokens = Object.values(TOKENS).filter(
+      (t) => t.status === 'live' && t.sacAddress
+    );
+    if (liveTokens.length < 2) return;
 
-    let totalExpired = 0;
+    let totalProcessed = 0;
 
     for (const tokenIn of liveTokens) {
       for (const tokenOut of liveTokens) {
         if (tokenIn.symbol === tokenOut.symbol) continue;
 
         try {
-          const expiredIds = await this.stellar.simulateAndParse<number[]>(
+          const expiredIds = await this.stellar.simulateAndParse<Array<number | bigint>>(
             this.swapbookContractId,
             'get_expired_timer_orders',
             [
@@ -93,100 +102,103 @@ export class TimerSweepService {
               StellarClient.toAddress(tokenOut.sacAddress),
             ]
           );
-
           if (!expiredIds || expiredIds.length === 0) continue;
 
           console.log(
-            `[TimerSweep] Found ${expiredIds.length} expired timer orders ` +
-            `for ${tokenIn.symbol}/${tokenOut.symbol}`
+            `[TimerSweep] ${expiredIds.length} expired timer orders on ${tokenIn.symbol}/${tokenOut.symbol}`
           );
-          totalExpired += expiredIds.length;
 
           for (const orderId of expiredIds) {
-            await this.processExpiredOrder(
-              orderId,
+            const processed = await this.processExpiredOrder(
+              Number(orderId),
               tokenIn.symbol,
               tokenIn.sacAddress,
               tokenOut.symbol,
-              tokenOut.sacAddress,
+              tokenOut.sacAddress
             );
+            if (processed) totalProcessed++;
           }
-        } catch (err) {
-          // Silently skip pairs that fail (most will have no orders)
+        } catch {
+          // Skip pairs that fail (most will simply have no orders)
         }
       }
     }
 
-    if (totalExpired > 0) {
-      console.log(`[TimerSweep] Sweep complete: processed ${totalExpired} expired orders`);
+    if (totalProcessed > 0) {
+      console.log(`[TimerSweep] Sweep complete: routed ${totalProcessed} orders`);
     }
   }
 
-  /** Process a single expired timer order. */
+  /** Route a single expired timer order through the Router contract. */
   private async processExpiredOrder(
     orderId: number,
     tokenInSymbol: string,
     tokenInAddress: string,
     tokenOutSymbol: string,
     tokenOutAddress: string,
-  ): Promise<void> {
-    // Fetch order details
-    const order = await this.stellar.simulateAndParse<any>(
+  ): Promise<boolean> {
+    const raw = await this.stellar.simulateAndParse<any>(
       this.swapbookContractId,
       'get_order',
       [StellarClient.toU64(orderId)]
     );
-
-    if (!order) {
+    if (!raw) {
       console.warn(`[TimerSweep] Could not fetch order ${orderId}`);
-      return;
+      return false;
     }
+    const status = scEnum(raw.status);
+    if (status !== 'Open' && status !== 'PartialFill') return false;
+    const remaining = BigInt(raw.amount_in_remaining ?? 0);
+    if (remaining <= 0n) return false;
 
-    const remaining = BigInt(order.amount_in_remaining ?? order.amountInRemaining ?? '0');
-    if (remaining <= 0n) return;
+    // Compute a route over Router-executable venues only
+    let route;
+    try {
+      route = await this.routingEngine.computeRoute(
+        tokenInAddress,
+        tokenOutAddress,
+        remaining,
+        50,
+        { executableOnly: true }
+      );
+    } catch (err) {
+      console.log(`[TimerSweep] No executable route for order #${orderId} — will retry next sweep`);
+      return false;
+    }
+    if (route.instructions.length === 0) return false;
 
     console.log(
-      `[TimerSweep] Order #${orderId}: ${remaining} ${tokenInSymbol} → ${tokenOutSymbol} ` +
-      `(timer expired, routing through DEXs)`
+      `[TimerSweep] Order #${orderId}: ${remaining} ${tokenInSymbol} → est. ` +
+      `${route.netAmountOut} ${tokenOutSymbol} via ${route.segments.map((s) => s.venueName).join(' + ')}`
     );
 
-    if (this.dryRun) {
-      // Compute what the route would look like
-      try {
-        const route = await this.routingEngine.computeRoute(
-          tokenInAddress,
-          tokenOutAddress,
-          remaining,
-        );
-        console.log(
-          `[TimerSweep] [DRY RUN] Would route ${remaining} ${tokenInSymbol} → ` +
-          `${route.netAmountOut} ${tokenOutSymbol} via ${route.segments.map(s => s.venueName).join(' + ')}`
-        );
-      } catch (err) {
-        console.log(`[TimerSweep] [DRY RUN] Route computation failed for order #${orderId}`);
-      }
-      return;
+    if (!this.keeper) {
+      console.log(`[TimerSweep] [DRY RUN] Would call route_expired_order(#${orderId})`);
+      return false;
     }
 
-    // LIVE MODE: claim and route
     try {
-      // Step 1: Claim the order (transfers escrowed tokens to router)
-      // This requires the router's signing key
-      // TODO: Implement when ADMIN_SECRET_KEY is configured
-      // const claimXdr = await this.stellar.buildTransaction(...)
-      // await this.stellar.submitTransaction(claimXdr)
-
-      // Step 2: Route through DEXs
-      // const route = await this.routingEngine.computeRoute(...)
-
-      // Step 3: Execute the DEX swap
-
-      // Step 4: Send proceeds to maker
-      // maker address = order.maker
-
-      console.log(`[TimerSweep] Successfully routed order #${orderId}`);
+      const result = await this.stellar.submitWithSigner(
+        this.keeper,
+        this.routerContractId,
+        'route_expired_order',
+        [
+          StellarClient.toU64(orderId),
+          StellarClient.toRouteSegments(
+            route.instructions.map((i) => ({
+              venueId: i.venueId,
+              amountIn: i.amountIn,
+              minAmountOut: i.minAmountOut,
+            }))
+          ),
+        ]
+      );
+      console.log(`[TimerSweep] Order #${orderId} routed (${result.status})`);
+      return result.status === 'SUCCESS';
     } catch (err) {
-      console.error(`[TimerSweep] Failed to process order #${orderId}:`, err);
+      // InsufficientOutput reverts land here — the maker's floor held.
+      console.error(`[TimerSweep] route_expired_order(#${orderId}) failed:`, err);
+      return false;
     }
   }
 }

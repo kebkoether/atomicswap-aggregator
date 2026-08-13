@@ -47,6 +47,14 @@ export interface VenueAdapter {
   /** Venue ID (matches on-chain Router registry) */
   readonly venueId: number;
 
+  /**
+   * Whether the on-chain Router contract can execute this venue via its
+   * adapter contract. SwapBook (P2P fills) and SDEX (classic ops) provide
+   * liquidity through other flows and must NOT appear in execute_route /
+   * route_expired_order segments.
+   */
+  readonly executable: boolean;
+
   /** Whether this venue is currently available */
   isAvailable(): Promise<boolean>;
 

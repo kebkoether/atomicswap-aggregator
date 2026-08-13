@@ -5,15 +5,17 @@
  * via the SwapBook contract's update_oracle_price method.
  *
  * For testnet: uses CoinGecko free tier (no API key needed).
- * For mainnet: should be replaced with a dedicated oracle like
- * Pyth, Chainlink, or a weighted-median price feed.
+ * For mainnet: replace with a SEP-40 oracle read (Reflector) or a
+ * weighted-median feed — a single REST source is not production-grade.
  *
- * Prices are stored as rational numbers (num/den) on-chain.
- * The contract validates freshness (< 1000 ledgers ≈ 83 min).
+ * The contract enforces: num/den > 0, freshness (< 1000 ledgers), and a
+ * max 20% jump between consecutive updates. A larger legitimate move must
+ * be pushed in steps — updateAllPrices logs when the cap rejects a push.
  */
 
+import { Keypair } from '@stellar/stellar-sdk';
 import { StellarClient } from '../stellar/client.js';
-import { TOKENS, TokenConfig } from '../stellar/tokens.js';
+import { TOKENS } from '../stellar/tokens.js';
 
 /** Pairs that need oracle prices (non-stablecoin assets). */
 const ORACLE_PAIRS: Array<{
@@ -21,6 +23,8 @@ const ORACLE_PAIRS: Array<{
   tokenOut: string;  // symbol of the quote asset (usually a stablecoin)
   coingeckoId: string;
 }> = [
+  // ⚠️ 'bitcoin' is a proxy for SolvBTC — track the actual SolvBTC market
+  // before enabling oracle-pegged SolvBTC pairs in production.
   { tokenIn: 'SolvBTC', tokenOut: 'USDC', coingeckoId: 'bitcoin' },
   { tokenIn: 'SolvBTC', tokenOut: 'PYUSD', coingeckoId: 'bitcoin' },
   { tokenIn: 'SolvBTC', tokenOut: 'USDY', coingeckoId: 'bitcoin' },
@@ -40,25 +44,35 @@ export class OraclePriceService {
   private intervalMs: number;
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastPrices: Map<string, PriceData> = new Map();
+  private oracleKeypair: InstanceType<typeof Keypair> | null = null;
 
   constructor(opts: {
     stellar: StellarClient;
     swapbookContractId: string;
     /** How often to refresh prices in milliseconds (default: 5 min) */
     intervalMs?: number;
+    /** Secret key of the on-chain oracle admin. Omit to cache locally only. */
+    oracleSecretKey?: string;
   }) {
     this.stellar = opts.stellar;
     this.swapbookContractId = opts.swapbookContractId;
     this.intervalMs = opts.intervalMs ?? 5 * 60 * 1000;
+    if (opts.oracleSecretKey) {
+      try {
+        this.oracleKeypair = Keypair.fromSecret(opts.oracleSecretKey);
+      } catch {
+        console.error('[Oracle] ORACLE_SECRET_KEY is not a valid Stellar secret — on-chain push disabled');
+      }
+    }
   }
 
   /** Start the periodic price update loop. */
   start(): void {
     console.log('[Oracle] Starting oracle price service');
     console.log(`[Oracle] Refresh interval: ${this.intervalMs / 1000}s`);
+    console.log(`[Oracle] On-chain push: ${this.oracleKeypair ? 'ENABLED' : 'disabled (no oracle key)'}`);
     console.log(`[Oracle] Tracked pairs: ${ORACLE_PAIRS.map(p => `${p.tokenIn}/${p.tokenOut}`).join(', ')}`);
 
-    // Run immediately, then on interval
     this.updateAllPrices().catch((err) =>
       console.error('[Oracle] Initial price update failed:', err)
     );
@@ -84,10 +98,7 @@ export class OraclePriceService {
 
   /** Fetch prices from CoinGecko and push to contract. */
   private async updateAllPrices(): Promise<void> {
-    // Deduplicate coingecko IDs
     const uniqueIds = [...new Set(ORACLE_PAIRS.map((p) => p.coingeckoId))];
-
-    // Fetch prices in one API call
     const prices = await this.fetchCoinGeckoPrices(uniqueIds);
 
     if (!prices) {
@@ -97,22 +108,15 @@ export class OraclePriceService {
 
     for (const pair of ORACLE_PAIRS) {
       const usdPrice = prices[pair.coingeckoId]?.usd;
-      if (!usdPrice) {
-        console.warn(`[Oracle] No price for ${pair.coingeckoId}`);
+      if (!usdPrice || usdPrice <= 0) {
+        console.warn(`[Oracle] No usable price for ${pair.coingeckoId}`);
         continue;
       }
 
-      // Convert USD price to the on-chain rational format.
-      // Both tokens use 7 decimals on Stellar.
-      // Price means: 1 unit of tokenIn = `usdPrice` units of tokenOut.
-      //
-      // For on-chain: fair_value = fill_amount_in * num / den
-      // If fill_amount_in is in 7-decimal raw units, and we want
-      // fair_value also in 7-decimal raw units, then num/den = usdPrice.
-      //
-      // Use integer math: multiply price by 10^7 to avoid fractions.
-      const SCALE = 10_000_000n; // 10^7
+      // Rational price scaled to 7 decimals (both sides use 7 on Stellar).
+      const SCALE = 10_000_000n;
       const priceScaled = BigInt(Math.round(usdPrice * 10_000_000));
+      if (priceScaled <= 0n) continue;
 
       const priceData: PriceData = {
         pair: `${pair.tokenIn}/${pair.tokenOut}`,
@@ -121,15 +125,8 @@ export class OraclePriceService {
         humanPrice: usdPrice,
         fetchedAt: new Date(),
       };
-
       this.lastPrices.set(`${pair.tokenIn}/${pair.tokenOut}`, priceData);
 
-      console.log(
-        `[Oracle] ${pair.tokenIn}/${pair.tokenOut} = $${usdPrice.toLocaleString()} ` +
-        `(num=${priceScaled}, den=${SCALE})`
-      );
-
-      // Push to contract (only if admin key is configured)
       await this.pushPriceOnChain(pair.tokenIn, pair.tokenOut, priceScaled, SCALE);
     }
   }
@@ -141,22 +138,37 @@ export class OraclePriceService {
     priceNum: bigint,
     priceDen: bigint,
   ): Promise<void> {
+    if (!this.oracleKeypair || !this.swapbookContractId) return;
+
     const tokenIn = TOKENS[tokenInSymbol];
     const tokenOut = TOKENS[tokenOutSymbol];
-
     if (!tokenIn?.sacAddress || !tokenOut?.sacAddress) {
-      // SAC addresses not yet configured — skip on-chain push
+      // SAC addresses not yet configured — cache-only for this pair
       return;
     }
 
     try {
-      // For on-chain updates we need the oracle admin key.
-      // If not configured, we just cache prices locally for the backend
-      // to use when validating fills.
-      // TODO: implement signed transaction submission once oracle admin key is set
-      console.log(`[Oracle] Price cached locally for ${tokenInSymbol}/${tokenOutSymbol} (on-chain push requires oracle admin key)`);
+      const result = await this.stellar.submitWithSigner(
+        this.oracleKeypair,
+        this.swapbookContractId,
+        'update_oracle_price',
+        [
+          StellarClient.toAddress(tokenIn.sacAddress),
+          StellarClient.toAddress(tokenOut.sacAddress),
+          StellarClient.toI128(priceNum),
+          StellarClient.toI128(priceDen),
+        ]
+      );
+      console.log(
+        `[Oracle] Pushed ${tokenInSymbol}/${tokenOutSymbol} on-chain (${result.status})`
+      );
     } catch (err) {
-      console.error(`[Oracle] Failed to push price on-chain for ${tokenInSymbol}/${tokenOutSymbol}:`, err);
+      // A rejected >20% jump lands here — the on-chain cap is working as
+      // designed; step the price if the move is legitimate.
+      console.error(
+        `[Oracle] On-chain push failed for ${tokenInSymbol}/${tokenOutSymbol}:`,
+        err
+      );
     }
   }
 
@@ -166,7 +178,7 @@ export class OraclePriceService {
   ): Promise<Record<string, { usd: number }> | null> {
     try {
       const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids.join(',')}&vs_currencies=usd`;
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
 
       if (!response.ok) {
         console.warn(`[Oracle] CoinGecko API returned ${response.status}`);

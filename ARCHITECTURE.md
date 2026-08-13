@@ -1,5 +1,13 @@
 # AtomicSwap Aggregator — Protocol Architecture
 
+> **Note (Aug 2026):** this is the original design document. The protocol was
+> security-hardened and several interfaces changed — contracts now use
+> `__constructor` (no `initialize`), timer claims settle atomically via
+> `Router.route_expired_order`, quoting is taker-direction via `quote_fill`,
+> the protocol fee applies to total routed output (rounded up), and SolvBTC
+> is not yet live on Stellar. Where this document disagrees with the code,
+> **`contracts/` and [README.md](./README.md) are the source of truth**.
+
 ## Overview
 
 AtomicSwap Aggregator is a peer-to-peer swap protocol on Stellar's Soroban smart contract platform. It combines a passive orderbook (users placing limit swaps that wait for counterparties) with smart order routing through Stellar DEXs when no counterparty is available.

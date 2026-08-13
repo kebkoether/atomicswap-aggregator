@@ -285,7 +285,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   const [maxSlippageBps, setMaxSlippageBps] = useState(50); // 0.50% default
   const [autoRouteMinutes, setAutoRouteMinutes] = useState(0); // 0 = no timer
   const [oraclePrice, setOraclePrice] = useState<number | null>(null);
-  const { connected: walletConnected, address: walletAddress, connect: connectWallet } = useWallet();
+  const { connected: walletConnected, address: walletAddress, connect: connectWallet, signTransaction } = useWallet();
 
   // Determine if either side is a volatile asset (needs oracle pricing)
   const isVolatilePair = tokenIn === 'SolvBTC' || tokenOut === 'SolvBTC';
@@ -387,14 +387,11 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
       });
 
       if (data.xdrs && data.xdrs.length > 0) {
-        // Sign each transaction with Freighter
-        const freighter = await import('@stellar/freighter-api');
+        // Sign each transaction via the wallet context (enforces the
+        // app's expected network before every signature)
+        const { submitTransaction } = await import('@/lib/api');
         for (const xdrStr of data.xdrs) {
-          const signed = await freighter.signTransaction(xdrStr, {
-            networkPassphrase: 'Test SDF Network ; September 2015',
-          });
-          // Submit signed transaction
-          const { submitTransaction } = await import('@/lib/api');
+          const signed = await signTransaction(xdrStr);
           await submitTransaction(signed);
         }
         alert('Order placed successfully! Check the Orders tab to see it.');
@@ -409,7 +406,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     } finally {
       setSubmitting(false);
     }
-  }, [walletAddress, p2pPlan, amountIn, tokenIn, tokenOut, priceMode, maxSlippageBps, autoRouteMinutes]);
+  }, [walletAddress, p2pPlan, amountIn, tokenIn, tokenOut, priceMode, maxSlippageBps, autoRouteMinutes, signTransaction]);
 
   // Handle instant swap execution
   const handleInstantSwap = useCallback(async () => {

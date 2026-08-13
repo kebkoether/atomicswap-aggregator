@@ -63,10 +63,10 @@ export const TOKENS: Record<string, TokenConfig> = {
   SolvBTC: {
     symbol: 'SolvBTC',
     name: 'Solv Protocol BTC',
-    issuer: '', // TODO: populate with Stellar issuer address
+    issuer: '', // Solv's Stellar deployment is paused pending LayerZero — do not mark live
     sacAddress: '',
     decimals: 7,
-    status: 'live',
+    status: 'coming_soon',
   },
 };
 
@@ -100,14 +100,31 @@ export function getTokenPairs(): Array<{ tokenIn: TokenConfig; tokenOut: TokenCo
  * Resolve a symbol or SAC address to a TokenConfig.
  */
 export function resolveToken(symbolOrAddress: string): TokenConfig | undefined {
-  // Try by symbol first
-  const bySymbol = TOKENS[symbolOrAddress.toUpperCase()];
+  // Try by symbol (case-insensitive — keys like 'SolvBTC' are mixed case)
+  const upper = symbolOrAddress.toUpperCase();
+  const bySymbol = Object.values(TOKENS).find(
+    (t) => t.symbol.toUpperCase() === upper
+  );
   if (bySymbol) return bySymbol;
 
   // Try by SAC address
   return Object.values(TOKENS).find(
     (t) => t.sacAddress === symbolOrAddress
   );
+}
+
+/**
+ * Resolve to a SAC contract address or throw. Every route/order endpoint
+ * must call this — passing raw symbols into Address() throws deep in the SDK.
+ */
+export function resolveSacAddress(symbolOrAddress: string): string {
+  // Already a contract address?
+  if (/^C[A-Z2-7]{55}$/.test(symbolOrAddress)) return symbolOrAddress;
+  const token = resolveToken(symbolOrAddress);
+  if (!token?.sacAddress) {
+    throw new Error(`Unknown token or missing SAC address: ${symbolOrAddress}`);
+  }
+  return token.sacAddress;
 }
 
 /**

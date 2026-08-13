@@ -1,16 +1,34 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror,
-    token, Address, Env, Vec, log,
+    contract, contractimpl, contracttype, contracterror, panic_with_error,
+    symbol_short, token, Address, Env, Vec, I256,
 };
 
-/// Protocol fee: 0.5 basis points = 5 per 100,000
+/// Protocol fee: 0.5 basis points = 5 per 100,000 (rounded up, min 1 stroop)
 const FEE_NUMERATOR: i128 = 5;
 const FEE_DENOMINATOR: i128 = 100_000;
 
 /// Basis-point denominator for slippage calculations
 const BPS_DENOMINATOR: i128 = 10_000;
+
+/// Oracle price must have been updated within this many ledgers (~83 min)
+const ORACLE_STALE_LEDGERS: u32 = 1000;
+
+/// Maximum allowed slippage tolerance for oracle-pegged orders (10%)
+const MAX_SLIPPAGE_BPS: u32 = 1000;
+
+/// Maximum allowed jump between consecutive oracle updates (20%).
+/// Larger legitimate moves must be pushed in steps; this bounds the
+/// damage of a compromised oracle key.
+const MAX_ORACLE_JUMP_BPS: i128 = 2000;
+
+/// Cap on open orders per pair index — keeps the index ledger entry bounded.
+const MAX_ORDERS_PER_PAIR: u32 = 200;
+
+/// Storage TTL management (ledgers): extend when below threshold, up to target.
+const TTL_THRESHOLD: u32 = 100_000;
+const TTL_EXTEND_TO: u32 = 518_400; // ~30 days at 5s/ledger
 
 // ─── Storage Keys ───────────────────────────────────────
 
@@ -22,10 +40,10 @@ pub enum DataKey {
     Order(u64),
     /// Index of open order IDs for a token pair (token_in, token_out)
     PairIndex(Address, Address),
-    /// Authorized router address (can claim timer-expired orders)
+    /// Authorized router address (can claim timer-expired orders).
+    /// This MUST be the Router *contract* so claims stay atomic on-chain.
     Router,
     /// Oracle price for a directed pair, stored as (price_num, price_den)
-    /// e.g. BTC/USDC = (62000, 1) meaning 1 BTC = 62,000 USDC
     OraclePrice(Address, Address),
     /// Authorized oracle updater address
     OracleAdmin,
@@ -57,9 +75,7 @@ pub enum PriceMode {
     Oracle,
 }
 
-/// Oracle price stored as a rational number (numerator / denominator)
-/// to avoid floating-point. Example: 1 BTC = 62,000 USDC → (62000_0000000, 1_0000000)
-/// when both assets have 7 decimals.
+/// Oracle price stored as a rational number (numerator / denominator).
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct OraclePriceData {
@@ -89,11 +105,26 @@ pub struct Order {
     /// Pricing strategy for this order
     pub price_mode: PriceMode,
     /// (Oracle mode only) maximum slippage tolerance in basis points
-    /// e.g. 50 = 0.50%
     pub max_slippage_bps: u32,
     /// Ledger sequence after which the router may claim this order and
     /// execute it through DEX liquidity. 0 = no auto-route (sit forever).
     pub auto_route_after: u32,
+}
+
+/// Returned by `claim_expired_timer` so the Router contract can enforce the
+/// maker's price on the DEX proceeds within the same invocation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ClaimedOrder {
+    pub order_id: u64,
+    pub maker: Address,
+    pub token_in: Address,
+    pub token_out: Address,
+    /// Escrowed amount transferred to the router
+    pub amount: i128,
+    /// Minimum token_out the maker must receive (net) for this claim,
+    /// derived from the order's fixed price or the current oracle price.
+    pub min_out: i128,
 }
 
 #[contracterror]
@@ -115,6 +146,12 @@ pub enum SwapBookError {
     TimerNotExpired = 13,
     RouterNotSet = 14,
     OraclePriceStale = 15,
+    Overflow = 16,
+    InvalidPrice = 17,
+    SlippageTooHigh = 18,
+    BookFull = 19,
+    OrderNotExpired = 20,
+    OracleJumpTooLarge = 21,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -124,75 +161,79 @@ pub struct SwapBook;
 
 #[contractimpl]
 impl SwapBook {
-    /// Initialize the contract with an admin, fee vault, and router address.
-    pub fn initialize(
-        env: Env,
-        admin: Address,
-        fee_vault: Address,
-    ) -> Result<(), SwapBookError> {
-        if env.storage().instance().has(&DataKey::Admin) {
-            return Err(SwapBookError::AlreadyInitialized);
-        }
+    /// Deploy-time constructor — atomic with deployment, cannot be front-run.
+    pub fn __constructor(env: Env, admin: Address, fee_vault: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::FeeVault, &fee_vault);
         env.storage().instance().set(&DataKey::NextOrderId, &1u64);
-        Ok(())
     }
 
     /// Set the authorized router address (admin only).
-    /// The router can claim timer-expired orders for DEX execution.
-    pub fn set_router(env: Env, admin: Address, router: Address) -> Result<(), SwapBookError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(SwapBookError::NotInitialized)?;
-        if admin != stored_admin {
-            return Err(SwapBookError::Unauthorized);
-        }
+    /// The router MUST be the Router contract, which claims timer-expired
+    /// orders and settles the maker atomically.
+    pub fn set_router(env: Env, router: Address) -> Result<(), SwapBookError> {
+        Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Router, &router);
         Ok(())
     }
 
     /// Set the authorized oracle admin (contract admin only).
-    pub fn set_oracle_admin(
-        env: Env,
-        admin: Address,
-        oracle_admin: Address,
-    ) -> Result<(), SwapBookError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(SwapBookError::NotInitialized)?;
-        if admin != stored_admin {
-            return Err(SwapBookError::Unauthorized);
-        }
+    pub fn set_oracle_admin(env: Env, oracle_admin: Address) -> Result<(), SwapBookError> {
+        Self::require_admin(&env)?;
         env.storage()
             .instance()
             .set(&DataKey::OracleAdmin, &oracle_admin);
         Ok(())
     }
 
-    /// Update an oracle price for a token pair. Only the oracle admin can call this.
+    /// Update an oracle price for a token pair. Only the oracle admin can call.
+    ///
+    /// Hardening:
+    /// - num and den must be strictly positive
+    /// - consecutive updates may not deviate more than MAX_ORACLE_JUMP_BPS
+    ///   from the stored price (bounds damage from a compromised key)
     pub fn update_oracle_price(
         env: Env,
-        caller: Address,
         token_in: Address,
         token_out: Address,
         price_num: i128,
         price_den: i128,
     ) -> Result<(), SwapBookError> {
-        caller.require_auth();
         let oracle_admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::OracleAdmin)
             .ok_or(SwapBookError::NotInitialized)?;
-        if caller != oracle_admin {
-            return Err(SwapBookError::Unauthorized);
+        oracle_admin.require_auth();
+
+        if price_num <= 0 || price_den <= 0 {
+            return Err(SwapBookError::InvalidPrice);
+        }
+
+        let price_key = DataKey::OraclePrice(token_in.clone(), token_out.clone());
+
+        // Deviation cap vs. previous price (cross-multiplied, overflow-safe):
+        // |new/old - 1| <= MAX_ORACLE_JUMP_BPS / 10000
+        if let Some(prev) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, OraclePriceData>(&price_key)
+        {
+            let new_x_oldden = I256::from_i128(&env, price_num)
+                .mul(&I256::from_i128(&env, prev.den));
+            let old_x_newden = I256::from_i128(&env, prev.num)
+                .mul(&I256::from_i128(&env, price_den));
+            let diff = if new_x_oldden > old_x_newden {
+                new_x_oldden.sub(&old_x_newden)
+            } else {
+                old_x_newden.sub(&new_x_oldden)
+            };
+            let max_diff = old_x_newden
+                .mul(&I256::from_i128(&env, MAX_ORACLE_JUMP_BPS))
+                .div(&I256::from_i128(&env, BPS_DENOMINATOR));
+            if diff > max_diff {
+                return Err(SwapBookError::OracleJumpTooLarge);
+            }
         }
 
         let price = OraclePriceData {
@@ -200,20 +241,22 @@ impl SwapBook {
             den: price_den,
             updated_at: env.ledger().sequence(),
         };
+        env.storage().persistent().set(&price_key, &price);
         env.storage()
             .persistent()
-            .set(&DataKey::OraclePrice(token_in, token_out), &price);
+            .extend_ttl(&price_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (symbol_short!("oracle"), symbol_short!("update")),
+            (token_in, token_out, price_num, price_den),
+        );
         Ok(())
     }
 
     /// Place a new swap order.
     ///
-    /// The maker authorizes the contract to hold `amount_in` of `token_in`.
-    /// The order sits in the book until a taker fills it, it expires, or
-    /// the maker cancels.
-    ///
     /// `price_mode`: 0 = Fixed (uses min_amount_out), 1 = Oracle (uses live price)
-    /// `max_slippage_bps`: only relevant for Oracle mode — max slippage tolerance
+    /// `max_slippage_bps`: Oracle mode only — must be 1..=MAX_SLIPPAGE_BPS
     /// `auto_route_after`: ledger sequence after which router can claim for DEX.
     ///                     0 = no auto-route (sit on book until expiry).
     pub fn place_order(
@@ -240,10 +283,13 @@ impl SwapBook {
             PriceMode::Fixed
         };
 
-        // For Fixed mode, min_amount_out must be > 0.
-        // For Oracle mode, min_amount_out can be 0 (oracle determines price).
         if mode == PriceMode::Fixed && min_amount_out <= 0 {
             return Err(SwapBookError::InvalidAmount);
+        }
+        if mode == PriceMode::Oracle
+            && (max_slippage_bps == 0 || max_slippage_bps > MAX_SLIPPAGE_BPS)
+        {
+            return Err(SwapBookError::SlippageTooHigh);
         }
 
         if token_in == token_out {
@@ -253,17 +299,26 @@ impl SwapBook {
             return Err(SwapBookError::OrderExpired);
         }
 
-        // If Oracle mode, verify that an oracle price exists for this pair
+        // If Oracle mode, verify that a fresh oracle price exists for this pair
         if mode == PriceMode::Oracle {
-            let price_key = DataKey::OraclePrice(token_in.clone(), token_out.clone());
-            if !env.storage().persistent().has(&price_key) {
-                return Err(SwapBookError::OraclePriceNotSet);
-            }
+            let price = Self::read_oracle(&env, &token_in, &token_out)?;
+            Self::check_oracle_fresh(&env, &price)?;
         }
 
         // Validate auto_route_after is in the future (if set)
         if auto_route_after > 0 && auto_route_after <= env.ledger().sequence() {
             return Err(SwapBookError::InvalidAmount);
+        }
+
+        // Bound the pair index size before escrowing anything
+        let pair_key = DataKey::PairIndex(token_in.clone(), token_out.clone());
+        let mut order_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&pair_key)
+            .unwrap_or(Vec::new(&env));
+        if order_ids.len() >= MAX_ORDERS_PER_PAIR {
+            return Err(SwapBookError::BookFull);
         }
 
         // Transfer token_in from maker to this contract (escrow)
@@ -280,7 +335,6 @@ impl SwapBook {
             .instance()
             .set(&DataKey::NextOrderId, &(order_id + 1));
 
-        // Create order
         let order = Order {
             id: order_id,
             maker: maker.clone(),
@@ -297,148 +351,98 @@ impl SwapBook {
             auto_route_after,
         };
 
-        // Store order
-        env.storage()
-            .persistent()
-            .set(&DataKey::Order(order_id), &order);
+        Self::write_order(&env, order_id, &order);
 
-        // Add to pair index
-        let pair_key = DataKey::PairIndex(token_in.clone(), token_out.clone());
-        let mut order_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&pair_key)
-            .unwrap_or(Vec::new(&env));
         order_ids.push_back(order_id);
         env.storage().persistent().set(&pair_key, &order_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&pair_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        log!(&env, "Order placed: id={}, amount_in={}, mode={}", order_id, amount_in, price_mode);
+        env.events().publish(
+            (symbol_short!("order"), symbol_short!("placed"), order_id),
+            (maker, token_in, token_out, amount_in, min_amount_out),
+        );
 
         Ok(order_id)
     }
 
     /// Cancel an open order. Only the maker can cancel.
     /// Returns escrowed tokens to the maker.
-    pub fn cancel_order(env: Env, maker: Address, order_id: u64) -> Result<(), SwapBookError> {
-        maker.require_auth();
+    pub fn cancel_order(env: Env, order_id: u64) -> Result<(), SwapBookError> {
+        let mut order: Order = Self::read_order(&env, order_id)?;
+        order.maker.require_auth();
 
-        let mut order: Order = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Order(order_id))
-            .ok_or(SwapBookError::OrderNotFound)?;
-
-        if order.maker != maker {
-            return Err(SwapBookError::Unauthorized);
-        }
         if order.status != OrderStatus::Open && order.status != OrderStatus::PartialFill {
             return Err(SwapBookError::OrderNotOpen);
         }
 
-        // Return remaining escrowed tokens to maker
         let token_client = token::Client::new(&env, &order.token_in);
         token_client.transfer(
             &env.current_contract_address(),
-            &maker,
+            &order.maker,
             &order.amount_in_remaining,
         );
 
         order.status = OrderStatus::Cancelled;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Order(order_id), &order);
-
-        // Remove from pair index
+        order.amount_in_remaining = 0;
+        Self::write_order(&env, order_id, &order);
         Self::remove_from_pair_index(&env, &order.token_in, &order.token_out, order_id);
 
-        log!(&env, "Order cancelled: id={}", order_id);
+        env.events().publish(
+            (symbol_short!("order"), symbol_short!("cancel"), order_id),
+            (),
+        );
+        Ok(())
+    }
 
+    /// Permissionless cleanup: refund and close an order whose expiry has
+    /// passed. Anyone may call (keeper-friendly); funds always go to the maker.
+    pub fn expire_order(env: Env, order_id: u64) -> Result<(), SwapBookError> {
+        let mut order: Order = Self::read_order(&env, order_id)?;
+
+        if order.status != OrderStatus::Open && order.status != OrderStatus::PartialFill {
+            return Err(SwapBookError::OrderNotOpen);
+        }
+        if env.ledger().sequence() <= order.expiry {
+            return Err(SwapBookError::OrderNotExpired);
+        }
+
+        if order.amount_in_remaining > 0 {
+            let token_client = token::Client::new(&env, &order.token_in);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &order.maker,
+                &order.amount_in_remaining,
+            );
+        }
+
+        order.status = OrderStatus::Expired;
+        order.amount_in_remaining = 0;
+        Self::write_order(&env, order_id, &order);
+        Self::remove_from_pair_index(&env, &order.token_in, &order.token_out, order_id);
+
+        env.events().publish(
+            (symbol_short!("order"), symbol_short!("expired"), order_id),
+            (),
+        );
         Ok(())
     }
 
     /// Fill an order completely. The taker provides `amount_out` of token_out,
     /// and receives the maker's escrowed token_in.
-    ///
-    /// For Fixed-price orders: amount_out must meet the maker's min_amount_out.
-    /// For Oracle-pegged orders: amount_out must be within max_slippage_bps of
-    /// the current oracle fair value.
-    ///
-    /// Protocol fee (0.5 bps) is deducted from the taker's payment before
-    /// forwarding to the maker.
     pub fn fill_order(
         env: Env,
         taker: Address,
         order_id: u64,
         amount_out: i128,
     ) -> Result<(), SwapBookError> {
-        taker.require_auth();
-
-        let mut order: Order = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Order(order_id))
-            .ok_or(SwapBookError::OrderNotFound)?;
-
-        if order.status != OrderStatus::Open && order.status != OrderStatus::PartialFill {
-            return Err(SwapBookError::OrderNotOpen);
-        }
-        if env.ledger().sequence() > order.expiry {
-            order.status = OrderStatus::Expired;
-            env.storage()
-                .persistent()
-                .set(&DataKey::Order(order_id), &order);
-            return Err(SwapBookError::OrderExpired);
-        }
-
-        // ── Price validation ────────────────────────────────
-        Self::validate_fill_price(
-            &env,
-            &order,
-            order.amount_in_remaining, // full fill
-            amount_out,
-        )?;
-
-        // Calculate fee
-        let fee = Self::calculate_fee(amount_out);
-        let maker_receives = amount_out - fee;
-
-        // Transfer token_out from taker
-        let token_out_client = token::Client::new(&env, &order.token_out);
-
-        // Taker pays maker (minus fee)
-        token_out_client.transfer(&taker, &order.maker, &maker_receives);
-
-        // Taker pays fee to vault
-        if fee > 0 {
-            let fee_vault: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeVault)
-                .ok_or(SwapBookError::NotInitialized)?;
-            token_out_client.transfer(&taker, &fee_vault, &fee);
-        }
-
-        // Transfer escrowed token_in from contract to taker
-        let token_in_client = token::Client::new(&env, &order.token_in);
-        token_in_client.transfer(
-            &env.current_contract_address(),
-            &taker,
-            &order.amount_in_remaining,
-        );
-
-        // Update order
-        order.amount_in_remaining = 0;
-        order.status = OrderStatus::Filled;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Order(order_id), &order);
-
-        // Remove from pair index
-        Self::remove_from_pair_index(&env, &order.token_in, &order.token_out, order_id);
-
-        log!(&env, "Order filled: id={}, taker_paid={}", order_id, amount_out);
-
-        Ok(())
+        let order: Order = Self::read_order(&env, order_id)?;
+        let remaining = order.amount_in_remaining;
+        Self::fill_internal(&env, taker, order, remaining, amount_out)
     }
 
     /// Partially fill an order.
@@ -452,99 +456,19 @@ impl SwapBook {
         fill_amount_in: i128,
         amount_out: i128,
     ) -> Result<(), SwapBookError> {
-        taker.require_auth();
-
-        let mut order: Order = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Order(order_id))
-            .ok_or(SwapBookError::OrderNotFound)?;
-
-        if order.status != OrderStatus::Open && order.status != OrderStatus::PartialFill {
-            return Err(SwapBookError::OrderNotOpen);
-        }
-        if env.ledger().sequence() > order.expiry {
-            order.status = OrderStatus::Expired;
-            env.storage()
-                .persistent()
-                .set(&DataKey::Order(order_id), &order);
-            return Err(SwapBookError::OrderExpired);
-        }
-        if fill_amount_in > order.amount_in_remaining {
-            return Err(SwapBookError::FillExceedsRemaining);
-        }
-        if fill_amount_in <= 0 || amount_out <= 0 {
-            return Err(SwapBookError::InvalidAmount);
-        }
-
-        // ── Price validation ────────────────────────────────
-        Self::validate_fill_price(&env, &order, fill_amount_in, amount_out)?;
-
-        // Calculate fee
-        let fee = Self::calculate_fee(amount_out);
-        let maker_receives = amount_out - fee;
-
-        // Transfer token_out from taker to maker (minus fee)
-        let token_out_client = token::Client::new(&env, &order.token_out);
-        token_out_client.transfer(&taker, &order.maker, &maker_receives);
-
-        // Fee to vault
-        if fee > 0 {
-            let fee_vault: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeVault)
-                .ok_or(SwapBookError::NotInitialized)?;
-            token_out_client.transfer(&taker, &fee_vault, &fee);
-        }
-
-        // Transfer partial token_in from contract to taker
-        let token_in_client = token::Client::new(&env, &order.token_in);
-        token_in_client.transfer(
-            &env.current_contract_address(),
-            &taker,
-            &fill_amount_in,
-        );
-
-        // Update order
-        order.amount_in_remaining -= fill_amount_in;
-        if order.amount_in_remaining == 0 {
-            order.status = OrderStatus::Filled;
-            Self::remove_from_pair_index(&env, &order.token_in, &order.token_out, order_id);
-        } else {
-            order.status = OrderStatus::PartialFill;
-        }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Order(order_id), &order);
-
-        log!(
-            &env,
-            "Order partial fill: id={}, filled={}, remaining={}",
-            order_id,
-            fill_amount_in,
-            order.amount_in_remaining
-        );
-
-        Ok(())
+        let order: Order = Self::read_order(&env, order_id)?;
+        Self::fill_internal(&env, taker, order, fill_amount_in, amount_out)
     }
 
     // ─── Query Functions ────────────────────────────────
 
     /// Get a specific order by ID.
     pub fn get_order(env: Env, order_id: u64) -> Result<Order, SwapBookError> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Order(order_id))
-            .ok_or(SwapBookError::OrderNotFound)
+        Self::read_order(&env, order_id)
     }
 
     /// Get all open order IDs for a token pair.
-    pub fn get_orders(
-        env: Env,
-        token_in: Address,
-        token_out: Address,
-    ) -> Vec<u64> {
+    pub fn get_orders(env: Env, token_in: Address, token_out: Address) -> Vec<u64> {
         let pair_key = DataKey::PairIndex(token_in, token_out);
         env.storage()
             .persistent()
@@ -552,93 +476,94 @@ impl SwapBook {
             .unwrap_or(Vec::new(&env))
     }
 
-    /// Get the best available price (highest amount_out per unit of amount_in)
-    /// from sitting orders for a given amount.
-    pub fn get_best_offer(
+    /// Quote a fill from the TAKER's perspective.
+    ///
+    /// The taker wants to acquire `token_buy` and pay with `token_pay`.
+    /// Scans orders where makers sell `token_buy` for `token_pay`
+    /// (i.e. PairIndex(token_buy, token_pay)) and greedily computes how much
+    /// `token_buy` the taker receives for spending up to `amount_pay`
+    /// (before protocol fee).
+    ///
+    /// Returns (amount_bought, amount_paid).
+    pub fn quote_fill(
         env: Env,
-        token_in: Address,
-        token_out: Address,
-        amount_in: i128,
-    ) -> i128 {
-        let order_ids = Self::get_orders(env.clone(), token_in.clone(), token_out.clone());
+        token_buy: Address,
+        token_pay: Address,
+        amount_pay: i128,
+    ) -> (i128, i128) {
+        if amount_pay <= 0 {
+            return (0, 0);
+        }
+        let order_ids = Self::get_orders(env.clone(), token_buy.clone(), token_pay.clone());
         let current_ledger = env.ledger().sequence();
-        let mut best_out: i128 = 0;
+        let mut budget = amount_pay;
+        let mut bought: i128 = 0;
 
         for i in 0..order_ids.len() {
+            if budget <= 0 {
+                break;
+            }
             let order_id = order_ids.get(i).unwrap();
-            if let Some(order) = env
+            let order: Order = match env
                 .storage()
                 .persistent()
-                .get::<DataKey, Order>(&DataKey::Order(order_id))
+                .get(&DataKey::Order(order_id))
             {
-                if order.status != OrderStatus::Open && order.status != OrderStatus::PartialFill {
-                    continue;
-                }
-                if current_ledger > order.expiry {
-                    continue;
-                }
-
-                // Calculate how much token_out this order can provide for amount_in
-                let fillable = if amount_in <= order.amount_in_remaining {
-                    amount_in
-                } else {
-                    order.amount_in_remaining
-                };
-
-                // Pro-rata output
-                let output = Self::pro_rata_min_out(
-                    order.min_amount_out,
-                    order.amount_in,
-                    fillable,
-                );
-
-                if output > best_out {
-                    best_out = output;
-                }
+                Some(o) => o,
+                None => continue,
+            };
+            if order.status != OrderStatus::Open && order.status != OrderStatus::PartialFill {
+                continue;
             }
+            if current_ledger > order.expiry {
+                continue;
+            }
+
+            // Max token_buy affordable from this order at its minimum price
+            let (max_fill, _) = match Self::max_affordable_fill(&env, &order, budget) {
+                Ok(v) => v,
+                Err(_) => continue, // e.g. stale oracle — skip
+            };
+            if max_fill <= 0 {
+                continue;
+            }
+            let pay = match Self::required_payment(&env, &order, max_fill) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if pay > budget {
+                continue;
+            }
+            bought += max_fill;
+            budget -= pay;
         }
 
-        best_out
+        (bought, amount_pay - budget)
     }
 
     // ─── Timer / Router Functions ──────────────────────
 
-    /// Claim a timer-expired order. Only the authorized router can call this.
+    /// Claim a timer-expired order. Only the authorized Router CONTRACT can
+    /// call this (invoker auth). The escrowed tokens transfer to the router,
+    /// which must — within the same invocation — execute the DEX route and
+    /// pay the maker at least `min_out` of token_out.
     ///
-    /// When an order's `auto_route_after` ledger has passed, the router takes
-    /// custody of the escrowed tokens and executes the swap through DEX
-    /// liquidity on behalf of the maker.
-    ///
-    /// The router is responsible for executing the DEX swap and sending
-    /// the proceeds (minus protocol fee) to the maker off-chain / in a
-    /// separate transaction.
-    pub fn claim_expired_timer(
-        env: Env,
-        router: Address,
-        order_id: u64,
-    ) -> Result<i128, SwapBookError> {
-        router.require_auth();
-
-        let stored_router: Address = env
+    /// `min_out` is derived on-chain from the order's own price terms:
+    ///   Fixed  → pro-rata min_amount_out over the remaining amount
+    ///   Oracle → current fresh oracle fair value minus max_slippage_bps
+    pub fn claim_expired_timer(env: Env, order_id: u64) -> Result<ClaimedOrder, SwapBookError> {
+        let router: Address = env
             .storage()
             .instance()
             .get(&DataKey::Router)
             .ok_or(SwapBookError::RouterNotSet)?;
-        if router != stored_router {
-            return Err(SwapBookError::Unauthorized);
-        }
+        router.require_auth();
 
-        let mut order: Order = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Order(order_id))
-            .ok_or(SwapBookError::OrderNotFound)?;
+        let mut order: Order = Self::read_order(&env, order_id)?;
 
         if order.status != OrderStatus::Open && order.status != OrderStatus::PartialFill {
             return Err(SwapBookError::OrderNotOpen);
         }
-
-        // Timer must be set and expired
         if order.auto_route_after == 0 {
             return Err(SwapBookError::TimerNotExpired);
         }
@@ -646,37 +571,34 @@ impl SwapBook {
             return Err(SwapBookError::TimerNotExpired);
         }
 
-        // Transfer remaining escrowed tokens to router for DEX execution
         let remaining = order.amount_in_remaining;
-        let token_in_client = token::Client::new(&env, &order.token_in);
-        token_in_client.transfer(
-            &env.current_contract_address(),
-            &router,
-            &remaining,
-        );
+        // The maker's price floor for the routed swap
+        let min_out = Self::required_payment(&env, &order, remaining)?;
 
-        // Mark order as routed
+        let token_in_client = token::Client::new(&env, &order.token_in);
+        token_in_client.transfer(&env.current_contract_address(), &router, &remaining);
+
         order.amount_in_remaining = 0;
         order.status = OrderStatus::Routed;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Order(order_id), &order);
-
-        // Remove from pair index
+        Self::write_order(&env, order_id, &order);
         Self::remove_from_pair_index(&env, &order.token_in, &order.token_out, order_id);
 
-        log!(
-            &env,
-            "Order timer expired, claimed by router: id={}, amount={}",
-            order_id,
-            remaining
+        env.events().publish(
+            (symbol_short!("order"), symbol_short!("claimed"), order_id),
+            (router, remaining, min_out),
         );
 
-        Ok(remaining)
+        Ok(ClaimedOrder {
+            order_id,
+            maker: order.maker,
+            token_in: order.token_in,
+            token_out: order.token_out,
+            amount: remaining,
+            min_out,
+        })
     }
 
     /// Get all orders whose auto_route_after timer has expired.
-    /// Used by the backend sweep job to find claimable orders.
     pub fn get_expired_timer_orders(
         env: Env,
         token_in: Address,
@@ -712,82 +634,225 @@ impl SwapBook {
         token_in: Address,
         token_out: Address,
     ) -> Result<(i128, i128, u32), SwapBookError> {
-        let price: OraclePriceData = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OraclePrice(token_in, token_out))
-            .ok_or(SwapBookError::OraclePriceNotSet)?;
+        let price = Self::read_oracle(&env, &token_in, &token_out)?;
         Ok((price.num, price.den, price.updated_at))
     }
 
     // ─── Internal Helpers ───────────────────────────────
 
-    /// Validate that amount_out meets the order's price requirements.
-    /// For Fixed mode: pro-rata min_amount_out check.
-    /// For Oracle mode: oracle price ± max_slippage_bps check.
-    fn validate_fill_price(
+    fn require_admin(env: &Env) -> Result<(), SwapBookError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(SwapBookError::NotInitialized)?;
+        admin.require_auth();
+        Ok(())
+    }
+
+    fn read_order(env: &Env, order_id: u64) -> Result<Order, SwapBookError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Order(order_id))
+            .ok_or(SwapBookError::OrderNotFound)
+    }
+
+    fn write_order(env: &Env, order_id: u64, order: &Order) {
+        let key = DataKey::Order(order_id);
+        env.storage().persistent().set(&key, order);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn read_oracle(
         env: &Env,
-        order: &Order,
-        fill_amount_in: i128,
-        amount_out: i128,
-    ) -> Result<(), SwapBookError> {
-        match order.price_mode {
-            PriceMode::Fixed => {
-                let required_out = Self::pro_rata_min_out(
-                    order.min_amount_out,
-                    order.amount_in,
-                    fill_amount_in,
-                );
-                if amount_out < required_out {
-                    return Err(SwapBookError::InsufficientOutput);
-                }
-            }
-            PriceMode::Oracle => {
-                // Read oracle price
-                let price: OraclePriceData = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::OraclePrice(
-                        order.token_in.clone(),
-                        order.token_out.clone(),
-                    ))
-                    .ok_or(SwapBookError::OraclePriceNotSet)?;
+        token_in: &Address,
+        token_out: &Address,
+    ) -> Result<OraclePriceData, SwapBookError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OraclePrice(token_in.clone(), token_out.clone()))
+            .ok_or(SwapBookError::OraclePriceNotSet)
+    }
 
-                // Oracle price must have been updated within 1000 ledgers (~83 min)
-                if env.ledger().sequence() > price.updated_at + 1000 {
-                    return Err(SwapBookError::OraclePriceStale);
-                }
-
-                // Fair value = fill_amount_in * (price.num / price.den)
-                let fair_value = (fill_amount_in * price.num) / price.den;
-
-                // Minimum acceptable = fair_value * (1 - max_slippage_bps / 10000)
-                let slippage = order.max_slippage_bps as i128;
-                let min_acceptable =
-                    (fair_value * (BPS_DENOMINATOR - slippage)) / BPS_DENOMINATOR;
-
-                if amount_out < min_acceptable {
-                    return Err(SwapBookError::OracleSlippageExceeded);
-                }
-            }
+    fn check_oracle_fresh(env: &Env, price: &OraclePriceData) -> Result<(), SwapBookError> {
+        if env.ledger().sequence() > price.updated_at + ORACLE_STALE_LEDGERS {
+            return Err(SwapBookError::OraclePriceStale);
         }
         Ok(())
     }
 
-    /// Calculate the protocol fee (0.5 bps).
-    fn calculate_fee(amount: i128) -> i128 {
-        (amount * FEE_NUMERATOR) / FEE_DENOMINATOR
+    /// Shared fill path for full and partial fills.
+    fn fill_internal(
+        env: &Env,
+        taker: Address,
+        mut order: Order,
+        fill_amount_in: i128,
+        amount_out: i128,
+    ) -> Result<(), SwapBookError> {
+        taker.require_auth();
+        let order_id = order.id;
+
+        if order.status != OrderStatus::Open && order.status != OrderStatus::PartialFill {
+            return Err(SwapBookError::OrderNotOpen);
+        }
+        if env.ledger().sequence() > order.expiry {
+            order.status = OrderStatus::Expired;
+            Self::write_order(env, order_id, &order);
+            return Err(SwapBookError::OrderExpired);
+        }
+        if fill_amount_in <= 0 || amount_out <= 0 {
+            return Err(SwapBookError::InvalidAmount);
+        }
+        if fill_amount_in > order.amount_in_remaining {
+            return Err(SwapBookError::FillExceedsRemaining);
+        }
+
+        // ── Price validation (ceiling — taker can never underpay) ──
+        let required_out = Self::required_payment(env, &order, fill_amount_in)?;
+        if amount_out < required_out {
+            return Err(match order.price_mode {
+                PriceMode::Fixed => SwapBookError::InsufficientOutput,
+                PriceMode::Oracle => SwapBookError::OracleSlippageExceeded,
+            });
+        }
+
+        // Fee rounds up (min 1 stroop) so no fill is fee-free
+        let fee = Self::calculate_fee(env, amount_out);
+        let maker_receives = amount_out - fee;
+
+        let token_out_client = token::Client::new(env, &order.token_out);
+        token_out_client.transfer(&taker, &order.maker, &maker_receives);
+        if fee > 0 {
+            let fee_vault: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeVault)
+                .ok_or(SwapBookError::NotInitialized)?;
+            token_out_client.transfer(&taker, &fee_vault, &fee);
+        }
+
+        let token_in_client = token::Client::new(env, &order.token_in);
+        token_in_client.transfer(
+            &env.current_contract_address(),
+            &taker,
+            &fill_amount_in,
+        );
+
+        order.amount_in_remaining -= fill_amount_in;
+        if order.amount_in_remaining == 0 {
+            order.status = OrderStatus::Filled;
+            Self::remove_from_pair_index(env, &order.token_in, &order.token_out, order_id);
+        } else {
+            order.status = OrderStatus::PartialFill;
+        }
+        Self::write_order(env, order_id, &order);
+
+        env.events().publish(
+            (symbol_short!("order"), symbol_short!("filled"), order_id),
+            (taker, fill_amount_in, amount_out, fee),
+        );
+        Ok(())
     }
 
-    /// Calculate pro-rata minimum output for a partial fill.
-    /// If the original order is 10,000 USDC → min 9,999.5 PYUSD,
-    /// then filling 5,000 USDC requires min 4,999.75 PYUSD.
-    fn pro_rata_min_out(
-        total_min_out: i128,
-        total_amount_in: i128,
+    /// The minimum token_out payment required to take `fill_amount_in` of the
+    /// order, per the order's pricing mode. Always rounds UP.
+    fn required_payment(
+        env: &Env,
+        order: &Order,
         fill_amount_in: i128,
-    ) -> i128 {
-        (total_min_out * fill_amount_in) / total_amount_in
+    ) -> Result<i128, SwapBookError> {
+        match order.price_mode {
+            PriceMode::Fixed => Ok(Self::muldiv_ceil(
+                env,
+                order.min_amount_out,
+                fill_amount_in,
+                order.amount_in,
+            )),
+            PriceMode::Oracle => {
+                let price = Self::read_oracle(env, &order.token_in, &order.token_out)?;
+                Self::check_oracle_fresh(env, &price)?;
+                // fair value of the fill at the oracle price
+                let fair = Self::muldiv_floor(env, fill_amount_in, price.num, price.den);
+                // minimum acceptable = fair * (1 - slippage), rounded up
+                let slippage = order.max_slippage_bps as i128;
+                Ok(Self::muldiv_ceil(
+                    env,
+                    fair,
+                    BPS_DENOMINATOR - slippage,
+                    BPS_DENOMINATOR,
+                ))
+            }
+        }
+    }
+
+    /// Given a taker budget of token_pay, the largest fill of the order's
+    /// token_in that the budget can afford. Returns (fill_amount, payment).
+    fn max_affordable_fill(
+        env: &Env,
+        order: &Order,
+        budget: i128,
+    ) -> Result<(i128, i128), SwapBookError> {
+        // Invert the price to estimate max fill, then verify with the exact
+        // (ceiling) payment and step down if rounding pushed it over budget.
+        let mut fill = match order.price_mode {
+            PriceMode::Fixed => Self::muldiv_floor(env, budget, order.amount_in, order.min_amount_out),
+            PriceMode::Oracle => {
+                let price = Self::read_oracle(env, &order.token_in, &order.token_out)?;
+                Self::check_oracle_fresh(env, &price)?;
+                let slippage = order.max_slippage_bps as i128;
+                // budget / (price * (1 - slippage))
+                let gross = Self::muldiv_floor(env, budget, BPS_DENOMINATOR, BPS_DENOMINATOR - slippage);
+                Self::muldiv_floor(env, gross, price.den, price.num)
+            }
+        };
+        if fill > order.amount_in_remaining {
+            fill = order.amount_in_remaining;
+        }
+        while fill > 0 {
+            let pay = Self::required_payment(env, order, fill)?;
+            if pay <= budget {
+                return Ok((fill, pay));
+            }
+            fill -= 1;
+        }
+        Ok((0, 0))
+    }
+
+    /// Protocol fee (0.5 bps), rounded up — never zero for a nonzero amount.
+    fn calculate_fee(env: &Env, amount: i128) -> i128 {
+        Self::muldiv_ceil(env, amount, FEE_NUMERATOR, FEE_DENOMINATOR)
+    }
+
+    /// floor(a * b / d) via 256-bit intermediate — no i128 overflow.
+    fn muldiv_floor(env: &Env, a: i128, b: i128, d: i128) -> i128 {
+        if d == 0 {
+            panic_with_error!(env, SwapBookError::InvalidPrice);
+        }
+        let r = I256::from_i128(env, a)
+            .mul(&I256::from_i128(env, b))
+            .div(&I256::from_i128(env, d));
+        match r.to_i128() {
+            Some(v) => v,
+            None => panic_with_error!(env, SwapBookError::Overflow),
+        }
+    }
+
+    /// ceil(a * b / d) via 256-bit intermediate — no i128 overflow.
+    /// Assumes non-negative operands (all amounts are validated > 0).
+    fn muldiv_ceil(env: &Env, a: i128, b: i128, d: i128) -> i128 {
+        if d == 0 {
+            panic_with_error!(env, SwapBookError::InvalidPrice);
+        }
+        let num = I256::from_i128(env, a).mul(&I256::from_i128(env, b));
+        let r = num
+            .add(&I256::from_i128(env, d - 1))
+            .div(&I256::from_i128(env, d));
+        match r.to_i128() {
+            Some(v) => v,
+            None => panic_with_error!(env, SwapBookError::Overflow),
+        }
     }
 
     /// Remove an order ID from the pair index.
