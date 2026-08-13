@@ -18,9 +18,10 @@ import rateLimit from 'express-rate-limit';
 import { RoutingEngine } from './router/engine.js';
 import { createVenueRegistry } from './venues/index.js';
 import { StellarClient, scEnum } from './stellar/client.js';
-import { TOKENS, resolveSacAddress } from './stellar/tokens.js';
+import { TOKENS, resolveToken, resolveSacAddress } from './stellar/tokens.js';
 import { OraclePriceService } from './services/oracle.js';
 import { TimerSweepService } from './services/timer-sweep.js';
+import { TokenDiscoveryService } from './services/token-discovery.js';
 
 const app = express();
 app.use(helmet());
@@ -55,6 +56,25 @@ const config = {
   sushiAdapterContractId: process.env.SUSHI_ADAPTER_CONTRACT_ID ?? '',
   horizonUrl: process.env.HORIZON_URL ?? 'https://horizon-testnet.stellar.org',
 };
+
+/**
+ * P2P (SwapBook) is scoped to this corridor. The on-chain book is
+ * asset-agnostic — this is a product-level gate, enforced here so the UI
+ * restriction can't be bypassed by calling the API directly.
+ */
+const P2P_ALLOWED_TOKENS = (process.env.P2P_ALLOWED_TOKENS ?? 'USDC,USDT0')
+  .split(',')
+  .map((s) => s.trim().toUpperCase())
+  .filter(Boolean);
+
+function assertP2pAllowed(raw: unknown, field: string): void {
+  const token = typeof raw === 'string' ? resolveToken(raw) : undefined;
+  if (!token || !P2P_ALLOWED_TOKENS.includes(token.symbol.toUpperCase())) {
+    throw new BadRequest(
+      `${field}: P2P swaps are limited to ${P2P_ALLOWED_TOKENS.join(', ')}`
+    );
+  }
+}
 
 /** Ledgers per second on Stellar (approx). */
 const LEDGER_SECONDS = 5;
@@ -159,6 +179,13 @@ const oracleService = new OraclePriceService({
 });
 oracleService.start();
 
+const tokenDiscovery = new TokenDiscoveryService({
+  aquaApiUrl: config.aquaApiUrl,
+  intervalMs: 10 * 60 * 1000, // 10 minutes
+  minTxCount: parseInt(process.env.DISCOVERY_MIN_TX_COUNT ?? '10'),
+});
+tokenDiscovery.start();
+
 const timerSweep = new TimerSweepService({
   stellar,
   swapbookContractId: config.swapbookContractId,
@@ -250,17 +277,17 @@ function muldivCeil(a: bigint, b: bigint, d: bigint): bigint {
 
 /**
  * GET /api/assets
+ *
+ * The aggregated token universe: the curated registry (verified) plus
+ * every token discovered from venue liquidity (currently Aqua pools).
+ * Discovered tokens are tradeable via instant swap only — P2P stays on
+ * the curated corridor.
  */
 app.get('/api/assets', (_req, res) => {
   res.json({
-    assets: Object.values(TOKENS).map((t) => ({
-      symbol: t.symbol,
-      name: t.name,
-      issuer: t.issuer,
-      sacAddress: t.sacAddress,
-      decimals: t.decimals,
-      status: t.status,
-    })),
+    assets: tokenDiscovery.getTokens(),
+    discovery: tokenDiscovery.getStatus(),
+    p2pAllowed: P2P_ALLOWED_TOKENS,
   });
 });
 
@@ -506,6 +533,8 @@ app.post('/api/swap/build', async (req, res) => {
 app.post('/api/peer-swap/build', async (req, res) => {
   try {
     const sourceAddress = parseStellarAccount(req.body.sourceAddress, 'sourceAddress');
+    assertP2pAllowed(req.body.tokenIn, 'tokenIn');
+    assertP2pAllowed(req.body.tokenOut, 'tokenOut');
     const tokenIn = resolveTokenParam(req.body.tokenIn, 'tokenIn');
     const tokenOut = resolveTokenParam(req.body.tokenOut, 'tokenOut');
     const amountInBig = parseAmount(req.body.amountIn, 'amountIn');
@@ -719,6 +748,7 @@ app.get('/api/health', async (_req, res) => {
   res.json({
     status: 'ok',
     venues: venues.map((v) => ({ name: v.name, executable: v.executable })),
+    discovery: tokenDiscovery.getStatus(),
     contracts: {
       swapbook: config.swapbookContractId,
       router: config.routerContractId,
