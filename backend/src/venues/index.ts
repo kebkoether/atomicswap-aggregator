@@ -73,4 +73,6 @@ export function createVenueRegistry(config: {
   return registry;
 }
 
-export { VenueAdapter, Quote, DepthQuote, SwapInstruction } from './adapter.js';
+// Interfaces must re-export as types — Node's native TS stripping (and any
+// isolatedModules build) errors on value re-exports of type-only names.
+export type { VenueAdapter, Quote, DepthQuote, SwapInstruction } from './adapter.js';

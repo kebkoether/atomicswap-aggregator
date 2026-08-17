@@ -70,6 +70,22 @@ export const TOKENS: Record<string, TokenConfig> = {
   },
 };
 
+// ── Environment overrides ────────────────────────────────────────────
+// Lets a deployment (testnet especially) repoint registry entries at
+// different assets without code edits:
+//   TOKEN_<SYMBOL>_ISSUER, TOKEN_<SYMBOL>_SAC, TOKEN_<SYMBOL>_STATUS
+// e.g. TOKEN_USDT0_SAC=C... TOKEN_USDT0_STATUS=live for the testnet
+// corridor where USDT0 is a test asset issued by the deployer.
+for (const t of Object.values(TOKENS)) {
+  const key = t.symbol.toUpperCase();
+  const issuer = process.env[`TOKEN_${key}_ISSUER`];
+  const sac = process.env[`TOKEN_${key}_SAC`];
+  const status = process.env[`TOKEN_${key}_STATUS`];
+  if (issuer) t.issuer = issuer;
+  if (sac) t.sacAddress = sac;
+  if (status === 'live' || status === 'coming_soon') t.status = status;
+}
+
 /**
  * Get all live tokens.
  */
