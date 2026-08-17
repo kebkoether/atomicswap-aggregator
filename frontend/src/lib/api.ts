@@ -145,6 +145,55 @@ export async function buildCancelOrder(
   return response.json();
 }
 
+// ─── TWAP ────────────────────────────────────────────────
+
+export async function buildTwap(body: {
+  sourceAddress: string;
+  tokenIn: string;
+  tokenOut: string;
+  amountIn: string;
+  durationMinutes: number;
+  limitPrice?: string;
+  maxSlippageBps?: number;
+  maxSlicePct?: number;
+  minSliceGapSeconds?: number;
+}): Promise<{ xdr: string; plan: any }> {
+  const response = await fetch(`${API_BASE}/api/twap/build`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error || `TWAP build failed: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function getTwapOrders(maker?: string): Promise<any[]> {
+  const params = maker ? `?maker=${encodeURIComponent(maker)}` : '';
+  const response = await fetch(`${API_BASE}/api/twap/orders${params}`);
+  if (!response.ok) throw new Error(`TWAP orders fetch failed: ${response.statusText}`);
+  const data = await response.json();
+  return data.orders;
+}
+
+export async function buildTwapCancel(
+  sourceAddress: string,
+  orderId: number
+): Promise<{ xdr: string }> {
+  const response = await fetch(`${API_BASE}/api/twap/cancel`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sourceAddress, orderId }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error || `Cancel build failed: ${response.statusText}`);
+  }
+  return response.json();
+}
+
 export async function submitTransaction(
   signedXdr: string
 ): Promise<{ status: string; result: any }> {

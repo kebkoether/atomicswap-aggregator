@@ -22,6 +22,7 @@ import { TOKENS, resolveToken, resolveSacAddress } from './stellar/tokens.js';
 import { OraclePriceService } from './services/oracle.js';
 import { TimerSweepService } from './services/timer-sweep.js';
 import { TokenDiscoveryService } from './services/token-discovery.js';
+import { TwapKeeperService } from './services/twap-keeper.js';
 
 const app = express();
 app.use(helmet());
@@ -54,6 +55,7 @@ const config = {
   aquaAdapterContractId: process.env.AQUA_ADAPTER_CONTRACT_ID ?? '',
   aquaApiUrl: process.env.AQUA_API_URL ?? 'https://amm-api-testnet.aqua.network/api/external/v1',
   sushiAdapterContractId: process.env.SUSHI_ADAPTER_CONTRACT_ID ?? '',
+  twapBookContractId: process.env.TWAP_BOOK_CONTRACT_ID ?? '',
   horizonUrl: process.env.HORIZON_URL ?? 'https://horizon-testnet.stellar.org',
 };
 
@@ -195,6 +197,15 @@ const timerSweep = new TimerSweepService({
   keeperSecretKey: process.env.KEEPER_SECRET_KEY ?? process.env.ADMIN_SECRET_KEY,
 });
 timerSweep.start();
+
+const twapKeeper = new TwapKeeperService({
+  stellar,
+  twapBookContractId: config.twapBookContractId,
+  routingEngine,
+  intervalMs: 30 * 1000, // 30 seconds
+  keeperSecretKey: process.env.KEEPER_SECRET_KEY ?? process.env.ADMIN_SECRET_KEY,
+});
+twapKeeper.start();
 
 // ─── Shared order helpers ───────────────────────────────
 
@@ -682,6 +693,202 @@ app.post('/api/peer-swap/build', async (req, res) => {
     });
   } catch (error) {
     handleError(res, error, 'Failed to build peer swap');
+  }
+});
+
+// ─── TWAP endpoints ─────────────────────────────────────
+
+/**
+ * POST /api/twap/build
+ *
+ * Build an unsigned place_twap transaction (escrows the total on signing).
+ *
+ * Body:
+ *   sourceAddress     - Maker's Stellar address
+ *   tokenIn, tokenOut - Symbols or SAC addresses
+ *   amountIn          - Total amount to execute (base units)
+ *   durationMinutes   - Execution window (5 min .. 30 days)
+ *   limitPrice        - Optional decimal price floor (min tokenOut per
+ *                       tokenIn, e.g. "0.9995"). Omit for oracle-bound.
+ *   maxSlippageBps    - Oracle mode slippage (default 50; ignored w/ limit)
+ *   maxSlicePct       - Per-slice cap as % of total (default 10)
+ *   minSliceGapSeconds- Min seconds between slices (default 60)
+ *   paceToleranceBps  - Catch-up headroom in bps of total (default 500)
+ */
+app.post('/api/twap/build', async (req, res) => {
+  try {
+    if (!config.twapBookContractId) throw new BadRequest('TWAP not deployed');
+    const sourceAddress = parseStellarAccount(req.body.sourceAddress, 'sourceAddress');
+    const tokenIn = resolveTokenParam(req.body.tokenIn, 'tokenIn');
+    const tokenOut = resolveTokenParam(req.body.tokenOut, 'tokenOut');
+    const amountIn = parseAmount(req.body.amountIn, 'amountIn');
+
+    const durationMinutes = Number(req.body.durationMinutes);
+    if (!Number.isFinite(durationMinutes) || durationMinutes < 5 || durationMinutes > 43_200) {
+      throw new BadRequest('durationMinutes must be between 5 and 43200 (30 days)');
+    }
+
+    // Limit price: decimal → rational scaled to 1e7
+    let limitNum = 0n;
+    let limitDen = 0n;
+    if (req.body.limitPrice !== undefined && req.body.limitPrice !== null && req.body.limitPrice !== '') {
+      const price = Number(req.body.limitPrice);
+      if (!Number.isFinite(price) || price <= 0) {
+        throw new BadRequest('limitPrice must be a positive number');
+      }
+      limitNum = BigInt(Math.round(price * 1e7));
+      limitDen = 10_000_000n;
+    }
+    const maxSlippageBps = limitNum > 0n ? 0 : parseSlippageBps(req.body.maxSlippageBps);
+
+    const maxSlicePct = Number(req.body.maxSlicePct ?? 10);
+    if (!Number.isFinite(maxSlicePct) || maxSlicePct < 1 || maxSlicePct > 100) {
+      throw new BadRequest('maxSlicePct must be 1..100');
+    }
+    const maxSliceIn = (amountIn * BigInt(Math.round(maxSlicePct * 100)) + 9999n) / 10000n;
+
+    const gapSeconds = Number(req.body.minSliceGapSeconds ?? 60);
+    if (!Number.isFinite(gapSeconds) || gapSeconds < LEDGER_SECONDS || gapSeconds > 86_400) {
+      throw new BadRequest('minSliceGapSeconds must be 5..86400');
+    }
+    const minSliceGap = Math.max(1, Math.round(gapSeconds / LEDGER_SECONDS));
+
+    const paceToleranceBps = Number(req.body.paceToleranceBps ?? 500);
+    if (!Number.isInteger(paceToleranceBps) || paceToleranceBps < 0 || paceToleranceBps > 5000) {
+      throw new BadRequest('paceToleranceBps must be 0..5000');
+    }
+
+    const currentLedger = await stellar.getLatestLedger();
+    const endLedger = currentLedger + Math.ceil((durationMinutes * 60) / LEDGER_SECONDS);
+
+    const xdr = await stellar.buildTransaction(
+      sourceAddress,
+      config.twapBookContractId,
+      'place_twap',
+      [
+        StellarClient.toAddress(sourceAddress),
+        StellarClient.toAddress(tokenIn),
+        StellarClient.toAddress(tokenOut),
+        StellarClient.toI128(amountIn),
+        StellarClient.toU32(endLedger),
+        StellarClient.toI128(limitNum),
+        StellarClient.toI128(limitDen),
+        StellarClient.toU32(maxSlippageBps),
+        StellarClient.toI128(maxSliceIn),
+        StellarClient.toU32(minSliceGap),
+        StellarClient.toU32(paceToleranceBps),
+      ]
+    );
+
+    res.json({
+      xdr,
+      plan: {
+        amountIn: amountIn.toString(),
+        endLedger,
+        durationMinutes,
+        limitPrice: limitNum > 0n ? req.body.limitPrice : null,
+        maxSlippageBps: limitNum > 0n ? null : maxSlippageBps,
+        maxSliceIn: maxSliceIn.toString(),
+        minSliceGapLedgers: minSliceGap,
+        paceToleranceBps,
+      },
+    });
+  } catch (error) {
+    handleError(res, error, 'Failed to build TWAP order');
+  }
+});
+
+/**
+ * GET /api/twap/orders?maker=G...
+ *
+ * Active TWAP orders (optionally filtered by maker) with progress state.
+ */
+app.get('/api/twap/orders', async (req, res) => {
+  try {
+    if (!config.twapBookContractId) {
+      res.json({ orders: [] });
+      return;
+    }
+    const makerFilter = typeof req.query.maker === 'string' ? req.query.maker : null;
+
+    const ids = await stellar.simulateAndParse<Array<number | bigint>>(
+      config.twapBookContractId,
+      'get_active_orders',
+      []
+    );
+    if (!ids || ids.length === 0) {
+      res.json({ orders: [] });
+      return;
+    }
+    const currentLedger = await stellar.getLatestLedger();
+
+    const orders = (
+      await Promise.all(
+        ids.map((id) =>
+          stellar.simulateAndParse<any>(config.twapBookContractId, 'get_order', [
+            StellarClient.toU64(BigInt(id)),
+          ])
+        )
+      )
+    )
+      .filter(Boolean)
+      .map((raw: any) => ({
+        id: Number(raw.id),
+        maker: String(raw.maker),
+        tokenIn: String(raw.token_in),
+        tokenOut: String(raw.token_out),
+        totalIn: String(raw.total_in),
+        filledIn: String(raw.filled_in),
+        receivedOut: String(raw.received_out),
+        startLedger: Number(raw.start_ledger),
+        endLedger: Number(raw.end_ledger),
+        limitNum: String(raw.limit_num),
+        limitDen: String(raw.limit_den),
+        maxSlippageBps: Number(raw.max_slippage_bps),
+        lastSliceLedger: Number(raw.last_slice_ledger),
+        status: scEnum(raw.status),
+        // convenience for the UI
+        pctFilled: Number((BigInt(raw.filled_in) * 10000n) / BigInt(raw.total_in)) / 100,
+        pctElapsed: Math.min(
+          100,
+          Math.max(
+            0,
+            ((currentLedger - Number(raw.start_ledger)) /
+              (Number(raw.end_ledger) - Number(raw.start_ledger))) * 100
+          )
+        ),
+        currentLedger,
+      }))
+      .filter((o) => !makerFilter || o.maker === makerFilter);
+
+    res.json({ orders });
+  } catch (error) {
+    handleError(res, error, 'Failed to fetch TWAP orders');
+  }
+});
+
+/**
+ * POST /api/twap/cancel
+ *
+ * Build an unsigned cancel_twap transaction (maker signs; remainder refunds).
+ */
+app.post('/api/twap/cancel', async (req, res) => {
+  try {
+    if (!config.twapBookContractId) throw new BadRequest('TWAP not deployed');
+    const sourceAddress = parseStellarAccount(req.body.sourceAddress, 'sourceAddress');
+    const orderId = Number(req.body.orderId);
+    if (!Number.isInteger(orderId) || orderId < 1) {
+      throw new BadRequest('orderId must be a positive integer');
+    }
+    const xdr = await stellar.buildTransaction(
+      sourceAddress,
+      config.twapBookContractId,
+      'cancel_twap',
+      [StellarClient.toU64(orderId)]
+    );
+    res.json({ xdr });
+  } catch (error) {
+    handleError(res, error, 'Failed to build cancel transaction');
   }
 });
 
