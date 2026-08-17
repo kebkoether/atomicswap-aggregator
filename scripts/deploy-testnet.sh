@@ -88,6 +88,30 @@ echo ""
 # placeholder — verify SushiSwap's actual Soroban router interface and
 # addresses first, then deploy and register it as venue 2.
 
+# Step 5b: Deploy TwapBook (time-weighted execution)
+echo "🚀 Deploying TwapBook..."
+stellar contract optimize --wasm "${WASM_DIR}/twap_book.wasm"
+TWAP_BOOK_ID=$(stellar contract deploy \
+    --wasm ${WASM_DIR}/twap_book.wasm \
+    --source ${DEPLOYER} \
+    --network ${NETWORK} \
+    -- \
+    --admin ${ADMIN_ADDRESS} \
+    --fee_vault ${FEE_VAULT_ID} \
+    --swap_book ${SWAPBOOK_ID})
+echo "   TwapBook: ${TWAP_BOOK_ID}"
+
+# TWAP slices execute through the same venue adapters as the Router
+stellar contract invoke \
+    --id ${TWAP_BOOK_ID} \
+    --source ${DEPLOYER} \
+    --network ${NETWORK} \
+    -- register_venue \
+    --venue_id 1 \
+    --contract_address ${AQUA_ADAPTER_ID}
+echo "   ✓ TwapBook venue 1 = Aqua"
+echo ""
+
 # Step 6: Deploy Router
 echo "🚀 Deploying Router..."
 ROUTER_ID=$(stellar contract deploy \

@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { useWallet } from '@/context/WalletContext';
-import { getUserOrders, buildCancelOrder, submitTransaction } from '@/lib/api';
+import { getUserOrders, buildCancelOrder, submitTransaction, getTwapOrders, buildTwapCancel } from '@/lib/api';
 
 interface Order {
   id: number;
@@ -45,15 +45,21 @@ function fillPercent(amountIn: string, remaining: string): number {
 export default function OrdersPage() {
   const { connected, address, signTransaction } = useWallet();
   const [orders, setOrders] = useState<Order[]>([]);
+  const [twapOrders, setTwapOrders] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [cancelling, setCancelling] = useState<number | null>(null);
+  const [twapCancelling, setTwapCancelling] = useState<number | null>(null);
 
   const fetchOrders = useCallback(async () => {
     if (!address) return;
     setLoading(true);
     try {
-      const userOrders = await getUserOrders(address);
+      const [userOrders, userTwaps] = await Promise.all([
+        getUserOrders(address),
+        getTwapOrders(address).catch(() => []),
+      ]);
       setOrders(userOrders || []);
+      setTwapOrders(userTwaps || []);
     } catch (err) {
       console.error('Failed to fetch orders:', err);
     } finally {
@@ -97,6 +103,24 @@ export default function OrdersPage() {
     [address, signTransaction, fetchOrders]
   );
 
+  const handleTwapCancel = useCallback(
+    async (orderId: number) => {
+      if (!address) return;
+      setTwapCancelling(orderId);
+      try {
+        const { xdr } = await buildTwapCancel(address, orderId);
+        const signedXdr = await signTransaction(xdr);
+        const result = await submitTransaction(signedXdr);
+        if (result.status === 'SUCCESS') await fetchOrders();
+      } catch (err) {
+        console.error('TWAP cancel failed:', err);
+      } finally {
+        setTwapCancelling(null);
+      }
+    },
+    [address, signTransaction, fetchOrders]
+  );
+
   const openOrders = orders.filter((o) => o.status === 'Open' || o.status === 'PartialFill');
   const pastOrders = orders.filter((o) => o.status !== 'Open' && o.status !== 'PartialFill');
 
@@ -116,6 +140,70 @@ export default function OrdersPage() {
       <p style={{ fontSize: '14px', color: '#8a8f9c', marginBottom: '28px' }}>
         P2P match orders placed through the SwapBook. Open orders are escrowed on-chain.
       </p>
+
+      {/* ── Active TWAP orders ── */}
+      {connected && twapOrders.length > 0 && (
+        <div style={{ marginBottom: '28px' }}>
+          <h2 style={{ fontSize: '15px', fontWeight: 700, color: '#e1e4ea', marginBottom: '12px' }}>
+            TWAP Orders
+          </h2>
+          {twapOrders.map((t) => {
+            const pctFilled = t.pctFilled ?? 0;
+            const pctElapsed = t.pctElapsed ?? 0;
+            const behind = pctFilled + 5 < pctElapsed;
+            return (
+              <div
+                key={t.id}
+                style={{
+                  background: '#131722',
+                  border: '1px solid #1a1f2e',
+                  borderRadius: '14px',
+                  padding: '16px',
+                  marginBottom: '10px',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                  <div style={{ fontSize: '14px', fontWeight: 600, color: '#e1e4ea' }}>
+                    TWAP #{t.id}
+                    <span style={{ marginLeft: '8px', fontSize: '11px', fontWeight: 600, color: '#6366f1', background: 'rgba(99,102,241,0.1)', padding: '2px 8px', borderRadius: '6px' }}>
+                      {t.status}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => handleTwapCancel(t.id)}
+                    disabled={twapCancelling === t.id}
+                    style={{
+                      padding: '6px 12px', borderRadius: '8px', fontSize: '12px', fontWeight: 600,
+                      border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.08)',
+                      color: '#ef4444', cursor: twapCancelling === t.id ? 'wait' : 'pointer',
+                    }}
+                  >
+                    {twapCancelling === t.id ? 'Cancelling…' : 'Cancel · refund rest'}
+                  </button>
+                </div>
+
+                {/* Progress: fill vs schedule */}
+                <div style={{ position: 'relative', height: '8px', background: '#0d1117', borderRadius: '4px', overflow: 'hidden', marginBottom: '8px' }}>
+                  {/* elapsed marker */}
+                  <div style={{ position: 'absolute', left: `${Math.min(100, pctElapsed)}%`, top: 0, bottom: 0, width: '2px', background: '#3a3f4c' }} />
+                  <div style={{ height: '100%', width: `${Math.min(100, pctFilled)}%`, background: behind ? 'linear-gradient(90deg,#f59e0b,#f97316)' : 'linear-gradient(90deg,#6366f1,#22c55e)', borderRadius: '4px' }} />
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: '#8a8f9c' }}>
+                  <span>
+                    Filled {(parseInt(t.filledIn) / 1e7).toLocaleString(undefined, { maximumFractionDigits: 2 })} / {(parseInt(t.totalIn) / 1e7).toLocaleString(undefined, { maximumFractionDigits: 2 })} ({pctFilled.toFixed(1)}%)
+                  </span>
+                  <span>
+                    {pctElapsed.toFixed(0)}% of window elapsed{behind ? ' · catching up' : ''}
+                  </span>
+                </div>
+                <div style={{ marginTop: '6px', fontSize: '12px', color: '#565b68' }}>
+                  Received so far: {(parseInt(t.receivedOut) / 1e7).toLocaleString(undefined, { maximumFractionDigits: 4 })} (streams to your wallet each slice)
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {!connected ? (
         <div

@@ -4,6 +4,7 @@ members = [
     "swap-book",
     "router",
     "fee-vault",
+    "twap-book",
     "adapters/aqua",
     "adapters/sushiswap",
 ]
