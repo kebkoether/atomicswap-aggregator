@@ -1,6 +1,11 @@
 /**
  * SwapBook venue adapter — queries our own on-chain orderbook
  * for sitting orders that can be matched peer-to-peer.
+ *
+ * Direction matters: a taker selling tokenIn for tokenOut is filled by
+ * makers on the REVERSE side of the book (makers selling tokenOut for
+ * tokenIn). The contract's `quote_fill(token_buy, token_pay, amount_pay)`
+ * encapsulates that — we pass token_buy = the taker's tokenOut.
  */
 
 import { VenueAdapter, Quote, DepthQuote, SwapInstruction } from './adapter.js';
@@ -9,6 +14,8 @@ import { StellarClient } from '../stellar/client.js';
 export class SwapBookAdapter implements VenueAdapter {
   readonly name = 'SwapBook';
   readonly venueId = 0; // SwapBook is venue 0 (internal)
+  // P2P fills execute via fill_order/partial_fill ops, not the Router.
+  readonly executable = false;
   private stellar: StellarClient;
 
   constructor(
@@ -27,19 +34,19 @@ export class SwapBookAdapter implements VenueAdapter {
     tokenOut: string,
     amountIn: bigint
   ): Promise<Quote> {
-    const amountOut = await this.queryBestOffer(tokenIn, tokenOut, amountIn);
+    const { bought, paid } = await this.quoteFill(tokenIn, tokenOut, amountIn);
 
     const effectiveBps =
-      amountIn > 0n && amountOut > 0n
-        ? Number(((amountIn - amountOut) * 10000n) / amountIn)
+      paid > 0n && bought > 0n
+        ? Number(((paid - bought) * 10000n) / paid)
         : Infinity;
 
     return {
       venue: this.name,
       tokenIn,
       tokenOut,
-      amountIn,
-      amountOut,
+      amountIn: paid,
+      amountOut: bought,
       effectiveBps: effectiveBps === Infinity ? 9999 : effectiveBps,
       gasCost: 100n,
     };
@@ -53,17 +60,13 @@ export class SwapBookAdapter implements VenueAdapter {
     const quotes: DepthQuote[] = [];
 
     for (const amount of amounts) {
-      const amountOut = await this.queryBestOffer(tokenIn, tokenOut, amount);
+      const { bought } = await this.quoteFill(tokenIn, tokenOut, amount);
 
-      if (amountOut === 0n) {
-        quotes.push({
-          amountIn: amount,
-          amountOut: 0n,
-          marginalBps: Infinity,
-        });
+      if (bought === 0n) {
+        quotes.push({ amountIn: amount, amountOut: 0n, marginalBps: Infinity });
       } else {
-        const marginalBps = Number(((amount - amountOut) * 10000n) / amount);
-        quotes.push({ amountIn: amount, amountOut, marginalBps });
+        const marginalBps = Number(((amount - bought) * 10000n) / amount);
+        quotes.push({ amountIn: amount, amountOut: bought, marginalBps });
       }
     }
 
@@ -85,24 +88,26 @@ export class SwapBookAdapter implements VenueAdapter {
   }
 
   /**
-   * Query the on-chain SwapBook for available liquidity.
-   * Uses simulateTransaction to call get_best_offer without gas cost.
+   * Taker-direction quote via the contract's quote_fill.
+   * tokenIn = what the taker pays; tokenOut = what the taker buys.
    */
-  private async queryBestOffer(
+  private async quoteFill(
     tokenIn: string,
     tokenOut: string,
     amountIn: bigint
-  ): Promise<bigint> {
-    const result = await this.stellar.simulateAndParse<bigint>(
+  ): Promise<{ bought: bigint; paid: bigint }> {
+    const result = await this.stellar.simulateAndParse<[bigint, bigint]>(
       this.contractId,
-      'get_best_offer',
+      'quote_fill',
       [
-        StellarClient.toAddress(tokenIn),
-        StellarClient.toAddress(tokenOut),
-        StellarClient.toI128(amountIn),
+        StellarClient.toAddress(tokenOut), // token_buy
+        StellarClient.toAddress(tokenIn),  // token_pay
+        StellarClient.toI128(amountIn),    // amount_pay
       ]
     );
 
-    return result ?? 0n;
+    if (!result) return { bought: 0n, paid: 0n };
+    const [bought, paid] = result;
+    return { bought: BigInt(bought), paid: BigInt(paid) };
   }
 }

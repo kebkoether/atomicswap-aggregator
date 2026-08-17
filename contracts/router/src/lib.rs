@@ -2,10 +2,10 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror,
-    token, Address, Env, IntoVal, Vec, log,
+    symbol_short, token, Address, Env, IntoVal, Symbol, Vec,
 };
 
-/// Protocol fee: 0.5 basis points = 5 per 100,000
+/// Protocol fee: 0.5 basis points = 5 per 100,000 (rounded up)
 const FEE_NUMERATOR: i128 = 5;
 const FEE_DENOMINATOR: i128 = 100_000;
 
@@ -15,7 +15,7 @@ const FEE_DENOMINATOR: i128 = 100_000;
 pub enum DataKey {
     Admin,
     FeeVault,
-    /// Map of venue_id -> contract address
+    /// Map of venue_id -> adapter contract address
     Venue(u32),
     /// List of all registered venue IDs
     VenueIds,
@@ -36,6 +36,18 @@ pub struct RouteSegment {
     pub min_amount_out: i128,
 }
 
+/// Mirror of SwapBook's ClaimedOrder (identical field names → identical XDR).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ClaimedOrder {
+    pub order_id: u64,
+    pub maker: Address,
+    pub token_in: Address,
+    pub token_out: Address,
+    pub amount: i128,
+    pub min_out: i128,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u32)]
@@ -50,49 +62,39 @@ pub enum RouterError {
     InvalidAmount = 8,
     RouteMismatch = 9,
     SameToken = 10,
+    SwapBookNotSet = 11,
 }
 
 // ─── Contract ───────────────────────────────────────────
-// Venue adapters are called via dynamic cross-contract invocation
-// (env.invoke_contract) rather than compile-time imports, since
-// adapters are deployed independently and may be added/removed.
+//
+// Venue adapters are called via dynamic cross-contract invocation.
+// Funds flow: the router PUSHES token_in to the adapter, then invokes
+// `swap`; the adapter executes on its venue and pushes token_out back.
+// (Direct transfers use invoker auth — no allowance juggling between
+// our own contracts.)
 
 #[contract]
 pub struct Router;
 
 #[contractimpl]
 impl Router {
-    /// Initialize the router with admin, fee vault, and swapbook addresses.
-    pub fn initialize(
-        env: Env,
-        admin: Address,
-        fee_vault: Address,
-        swap_book: Address,
-    ) -> Result<(), RouterError> {
-        if env.storage().instance().has(&DataKey::Admin) {
-            return Err(RouterError::AlreadyInitialized);
-        }
+    /// Deploy-time constructor — atomic with deployment, cannot be front-run.
+    pub fn __constructor(env: Env, admin: Address, fee_vault: Address, swap_book: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::FeeVault, &fee_vault);
         env.storage().instance().set(&DataKey::SwapBook, &swap_book);
         env.storage()
             .instance()
             .set(&DataKey::VenueIds, &Vec::<u32>::new(&env));
-        Ok(())
     }
 
-    /// Register a new DEX venue. Admin only.
-    ///
-    /// `venue_id`: unique numeric ID (e.g., 1 = Aqua, 2 = SushiSwap, 3 = Curve)
-    /// `contract_address`: the adapter contract for this venue
+    /// Register a new DEX venue adapter. Admin only.
     pub fn register_venue(
         env: Env,
-        admin: Address,
         venue_id: u32,
         contract_address: Address,
     ) -> Result<(), RouterError> {
-        admin.require_auth();
-        Self::require_admin(&env, &admin)?;
+        Self::require_admin(&env)?;
 
         if env.storage().persistent().has(&DataKey::Venue(venue_id)) {
             return Err(RouterError::VenueAlreadyRegistered);
@@ -102,38 +104,30 @@ impl Router {
             .persistent()
             .set(&DataKey::Venue(venue_id), &contract_address);
 
-        // Add to venue ID list
         let mut venue_ids: Vec<u32> = env
             .storage()
             .instance()
             .get(&DataKey::VenueIds)
             .unwrap_or(Vec::new(&env));
         venue_ids.push_back(venue_id);
-        env.storage()
-            .instance()
-            .set(&DataKey::VenueIds, &venue_ids);
+        env.storage().instance().set(&DataKey::VenueIds, &venue_ids);
 
-        log!(&env, "Venue registered: id={}, contract={}", venue_id, contract_address);
-
+        env.events().publish(
+            (symbol_short!("venue"), symbol_short!("register")),
+            (venue_id, contract_address),
+        );
         Ok(())
     }
 
     /// Remove a venue. Admin only.
-    pub fn remove_venue(
-        env: Env,
-        admin: Address,
-        venue_id: u32,
-    ) -> Result<(), RouterError> {
-        admin.require_auth();
-        Self::require_admin(&env, &admin)?;
+    pub fn remove_venue(env: Env, venue_id: u32) -> Result<(), RouterError> {
+        Self::require_admin(&env)?;
 
         if !env.storage().persistent().has(&DataKey::Venue(venue_id)) {
             return Err(RouterError::VenueNotFound);
         }
-
         env.storage().persistent().remove(&DataKey::Venue(venue_id));
 
-        // Remove from venue ID list
         let venue_ids: Vec<u32> = env
             .storage()
             .instance()
@@ -148,20 +142,18 @@ impl Router {
         }
         env.storage().instance().set(&DataKey::VenueIds, &new_ids);
 
-        log!(&env, "Venue removed: id={}", venue_id);
-
+        env.events().publish(
+            (symbol_short!("venue"), symbol_short!("remove")),
+            venue_id,
+        );
         Ok(())
     }
 
-    /// Execute a multi-venue routed swap.
+    /// Execute a multi-venue routed swap for `user`.
     ///
-    /// The route (list of segments) is computed off-chain by the backend.
-    /// This contract verifies that:
-    /// 1. Segment amounts sum to total_amount_in
-    /// 2. Total output meets min_total_out
-    /// 3. Each venue exists
-    ///
-    /// Protocol fee (0.5 bps) is deducted from the total output.
+    /// Verifies: segments are positive and sum to total_amount_in; every
+    /// venue exists; net output (after the 0.5 bps protocol fee on the
+    /// TOTAL output) meets min_total_out — otherwise the whole tx reverts.
     pub fn execute_route(
         env: Env,
         user: Address,
@@ -179,103 +171,37 @@ impl Router {
         if token_in == token_out {
             return Err(RouterError::SameToken);
         }
-        if segments.is_empty() {
-            return Err(RouterError::InvalidRoute);
-        }
+        Self::validate_segments(&segments, total_amount_in)?;
 
-        // Verify segments sum to total
-        let mut segment_sum: i128 = 0;
-        for i in 0..segments.len() {
-            let seg = segments.get(i).unwrap();
-            segment_sum += seg.amount_in;
-        }
-        if segment_sum != total_amount_in {
-            return Err(RouterError::RouteMismatch);
-        }
-
-        // Transfer total token_in from user to this contract
+        // Pull total token_in from user
         let token_in_client = token::Client::new(&env, &token_in);
         token_in_client.transfer(&user, &env.current_contract_address(), &total_amount_in);
 
-        // Execute each segment
-        let mut total_out: i128 = 0;
+        let total_out = Self::execute_segments(&env, &token_in, &token_out, &segments)?;
 
-        for i in 0..segments.len() {
-            let seg = segments.get(i).unwrap();
-
-            // Look up venue adapter contract
-            let venue_contract: Address = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Venue(seg.venue_id))
-                .ok_or(RouterError::VenueNotFound)?;
-
-            // Approve the venue adapter to spend our token_in
-            token_in_client.approve(
-                &env.current_contract_address(),
-                &venue_contract,
-                &seg.amount_in,
-                &(env.ledger().sequence() + 100), // short-lived approval
-            );
-
-            // Cross-contract call to venue adapter's swap function.
-            // Each adapter implements: swap(user, token_in, token_out, amount_in, min_out) -> i128
-            let amount_received: i128 = env.invoke_contract(
-                &venue_contract,
-                &soroban_sdk::Symbol::new(&env, "swap"),
-                soroban_sdk::vec![
-                    &env,
-                    env.current_contract_address().into_val(&env),
-                    token_in.clone().into_val(&env),
-                    token_out.clone().into_val(&env),
-                    seg.amount_in.into_val(&env),
-                    seg.min_amount_out.into_val(&env),
-                ],
-            );
-
-            total_out += amount_received;
-        }
-
-        // Deduct protocol fee from total output
+        // Protocol fee on total output (rounded up)
         let fee = Self::calculate_fee(total_out);
         let user_receives = total_out - fee;
 
         if user_receives < min_total_out {
-            // This would revert the entire transaction
             return Err(RouterError::InsufficientOutput);
         }
 
-        // Transfer output to user
         let token_out_client = token::Client::new(&env, &token_out);
-        token_out_client.transfer(
-            &env.current_contract_address(),
-            &user,
-            &user_receives,
-        );
-
-        // Transfer fee to vault
+        token_out_client.transfer(&env.current_contract_address(), &user, &user_receives);
         if fee > 0 {
             let fee_vault: Address = env
                 .storage()
                 .instance()
                 .get(&DataKey::FeeVault)
                 .ok_or(RouterError::NotInitialized)?;
-            token_out_client.transfer(
-                &env.current_contract_address(),
-                &fee_vault,
-                &fee,
-            );
+            token_out_client.transfer(&env.current_contract_address(), &fee_vault, &fee);
         }
 
-        log!(
-            &env,
-            "Route executed: in={}, out={}, fee={}, segments={}",
-            total_amount_in,
-            user_receives,
-            fee,
-            segments.len()
+        env.events().publish(
+            (symbol_short!("route"), symbol_short!("exec")),
+            (user, token_in, token_out, total_amount_in, user_receives, fee),
         );
-
         Ok(user_receives)
     }
 
@@ -289,7 +215,6 @@ impl Router {
         min_amount_out: i128,
         venue_id: u32,
     ) -> Result<i128, RouterError> {
-        // Build a single-segment route and delegate
         let segment = RouteSegment {
             venue_id,
             amount_in,
@@ -305,6 +230,72 @@ impl Router {
             min_amount_out,
             segments,
         )
+    }
+
+    /// PERMISSIONLESS keeper entry point: route a timer-expired SwapBook
+    /// order through DEX venues and settle the maker — all in one invocation.
+    ///
+    /// 1. Claims the order from SwapBook (escrow moves to this contract;
+    ///    SwapBook authorizes us via invoker auth and returns the maker's
+    ///    on-chain price floor `min_out`).
+    /// 2. Executes the provided route segments.
+    /// 3. Deducts the protocol fee, enforces net proceeds >= min_out,
+    ///    and pays the maker.
+    ///
+    /// Anyone may call this — a caller gains nothing (proceeds always go to
+    /// the maker) and a bad route simply reverts, leaving the order claimable
+    /// again... (revert restores the order's Open state too).
+    pub fn route_expired_order(
+        env: Env,
+        order_id: u64,
+        segments: Vec<RouteSegment>,
+    ) -> Result<i128, RouterError> {
+        let swap_book: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SwapBook)
+            .ok_or(RouterError::SwapBookNotSet)?;
+
+        // Claim escrow + price floor from SwapBook (invoker auth)
+        let claimed: ClaimedOrder = env.invoke_contract(
+            &swap_book,
+            &Symbol::new(&env, "claim_expired_timer"),
+            soroban_sdk::vec![&env, order_id.into_val(&env)],
+        );
+
+        Self::validate_segments(&segments, claimed.amount)?;
+
+        let total_out =
+            Self::execute_segments(&env, &claimed.token_in, &claimed.token_out, &segments)?;
+
+        let fee = Self::calculate_fee(total_out);
+        let maker_receives = total_out - fee;
+
+        // The maker's own price terms are the floor — never settle below it.
+        if maker_receives < claimed.min_out {
+            return Err(RouterError::InsufficientOutput);
+        }
+
+        let token_out_client = token::Client::new(&env, &claimed.token_out);
+        token_out_client.transfer(
+            &env.current_contract_address(),
+            &claimed.maker,
+            &maker_receives,
+        );
+        if fee > 0 {
+            let fee_vault: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeVault)
+                .ok_or(RouterError::NotInitialized)?;
+            token_out_client.transfer(&env.current_contract_address(), &fee_vault, &fee);
+        }
+
+        env.events().publish(
+            (symbol_short!("route"), symbol_short!("timer"), order_id),
+            (claimed.maker, claimed.amount, maker_receives, fee),
+        );
+        Ok(maker_receives)
     }
 
     // ─── Query Functions ────────────────────────────────
@@ -327,19 +318,97 @@ impl Router {
 
     // ─── Internal ───────────────────────────────────────
 
-    fn calculate_fee(amount: i128) -> i128 {
-        (amount * FEE_NUMERATOR) / FEE_DENOMINATOR
+    fn validate_segments(
+        segments: &Vec<RouteSegment>,
+        total_amount_in: i128,
+    ) -> Result<(), RouterError> {
+        if segments.is_empty() {
+            return Err(RouterError::InvalidRoute);
+        }
+        let mut segment_sum: i128 = 0;
+        for i in 0..segments.len() {
+            let seg = segments.get(i).unwrap();
+            if seg.amount_in <= 0 || seg.min_amount_out < 0 {
+                return Err(RouterError::InvalidAmount);
+            }
+            segment_sum += seg.amount_in;
+        }
+        if segment_sum != total_amount_in {
+            return Err(RouterError::RouteMismatch);
+        }
+        Ok(())
     }
 
-    fn require_admin(env: &Env, caller: &Address) -> Result<(), RouterError> {
+    /// Execute each leg: push token_in to the adapter, invoke its `swap`,
+    /// sum the outputs the adapters push back.
+    fn execute_segments(
+        env: &Env,
+        token_in: &Address,
+        token_out: &Address,
+        segments: &Vec<RouteSegment>,
+    ) -> Result<i128, RouterError> {
+        let token_in_client = token::Client::new(env, token_in);
+        let mut total_out: i128 = 0;
+
+        for i in 0..segments.len() {
+            let seg = segments.get(i).unwrap();
+
+            let venue_contract: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Venue(seg.venue_id))
+                .ok_or(RouterError::VenueNotFound)?;
+
+            // Push this leg's input to the adapter (invoker auth — we are
+            // the direct invoker of the token contract).
+            token_in_client.transfer(
+                &env.current_contract_address(),
+                &venue_contract,
+                &seg.amount_in,
+            );
+
+            // Adapter interface:
+            // swap(recipient, token_in, token_out, amount_in, min_out) -> i128
+            let amount_received: i128 = env.invoke_contract(
+                &venue_contract,
+                &Symbol::new(env, "swap"),
+                soroban_sdk::vec![
+                    env,
+                    env.current_contract_address().into_val(env),
+                    token_in.into_val(env),
+                    token_out.into_val(env),
+                    seg.amount_in.into_val(env),
+                    seg.min_amount_out.into_val(env),
+                ],
+            );
+
+            if amount_received < seg.min_amount_out {
+                return Err(RouterError::InsufficientOutput);
+            }
+            total_out += amount_received;
+        }
+
+        Ok(total_out)
+    }
+
+    /// Protocol fee (0.5 bps), rounded up.
+    fn calculate_fee(amount: i128) -> i128 {
+        if amount <= 0 {
+            return 0;
+        }
+        (amount * FEE_NUMERATOR + FEE_DENOMINATOR - 1) / FEE_DENOMINATOR
+    }
+
+    fn require_admin(env: &Env) -> Result<(), RouterError> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(RouterError::NotInitialized)?;
-        if *caller != admin {
-            return Err(RouterError::Unauthorized);
-        }
+        admin.require_auth();
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod test;

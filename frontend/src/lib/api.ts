@@ -10,6 +10,12 @@ export interface Asset {
   issuer: string;
   decimals: number;
   status: 'live' | 'coming_soon';
+  /** SAC contract address (empty until configured/discovered) */
+  sacAddress?: string;
+  /** 'curated' (registry) or a venue name like 'aqua' */
+  source?: string;
+  /** Curated entries are verified; venue-discovered ones are not */
+  verified?: boolean;
 }
 
 export interface RouteSegment {

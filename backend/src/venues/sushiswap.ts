@@ -12,6 +12,8 @@ import { StellarClient } from '../stellar/client.js';
 export class SushiSwapAdapter implements VenueAdapter {
   readonly name = 'SushiSwap';
   readonly venueId = 2;
+  // ⚠️ Sushi's Soroban ABI is unverified — placeholder adapter cannot execute yet.
+  readonly executable = false;
   private stellar: StellarClient;
 
   constructor(

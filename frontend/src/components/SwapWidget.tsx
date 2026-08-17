@@ -12,17 +12,54 @@ interface Token {
   color: string;
   letterBg: string;
   status: 'live' | 'coming_soon';
+  /** SAC contract address (preferred API identifier when present) */
+  sacAddress?: string;
+  /** Curated registry entries are verified; venue-discovered ones are not */
+  verified?: boolean;
 }
 
+/**
+ * Curated fallback list — replaced at runtime by /api/assets, which
+ * aggregates the curated registry with every token discovered from venue
+ * liquidity (Aqua pools today; Sushi once their API is verified).
+ */
 const TOKENS: Token[] = [
-  { symbol: 'USDC', name: 'USD Coin', color: '#2775ca', letterBg: '#2775ca', status: 'live' },
-  { symbol: 'PYUSD', name: 'PayPal USD', color: '#0070e0', letterBg: '#003087', status: 'live' },
-  { symbol: 'USDY', name: 'Ondo USDY', color: '#5865f2', letterBg: '#1a1a6e', status: 'live' },
-  { symbol: 'USDT0', name: 'Tether', color: '#26a17b', letterBg: '#26a17b', status: 'coming_soon' },
-  { symbol: 'SolvBTC', name: 'Solv BTC', color: '#f7931a', letterBg: '#f7931a', status: 'live' },
+  { symbol: 'USDC', name: 'USD Coin', color: '#2775ca', letterBg: '#2775ca', status: 'live', verified: true },
+  { symbol: 'PYUSD', name: 'PayPal USD', color: '#0070e0', letterBg: '#003087', status: 'live', verified: true },
+  { symbol: 'USDY', name: 'Ondo USDY', color: '#5865f2', letterBg: '#1a1a6e', status: 'live', verified: true },
+  { symbol: 'USDT0', name: 'Tether', color: '#26a17b', letterBg: '#26a17b', status: 'coming_soon', verified: true },
+  { symbol: 'SolvBTC', name: 'Solv BTC', color: '#f7931a', letterBg: '#f7931a', status: 'coming_soon', verified: true },
 ];
 
-const LIVE_TOKENS = TOKENS.filter((t) => t.status === 'live');
+const CURATED_STYLE: Record<string, { color: string; letterBg: string }> =
+  Object.fromEntries(TOKENS.map((t) => [t.symbol, { color: t.color, letterBg: t.letterBg }]));
+
+/** Deterministic color for venue-discovered tokens. */
+function hashColor(symbol: string): string {
+  let h = 0;
+  for (let i = 0; i < symbol.length; i++) h = (h * 31 + symbol.charCodeAt(i)) >>> 0;
+  return `hsl(${h % 360}, 55%, 48%)`;
+}
+
+function assetToToken(asset: any): Token {
+  const style = CURATED_STYLE[asset.symbol] ?? {
+    color: hashColor(asset.symbol),
+    letterBg: hashColor(asset.symbol),
+  };
+  return {
+    symbol: asset.symbol,
+    name: asset.name,
+    color: style.color,
+    letterBg: style.letterBg,
+    status: asset.status,
+    sacAddress: asset.sacAddress || undefined,
+    verified: asset.verified ?? asset.source === 'curated',
+  };
+}
+
+// P2P matching is scoped to the USDC/USDT0 corridor. (USDT0 unlocks
+// automatically once its registry entry flips to 'live'.)
+const P2P_ALLOWED = ['USDC', 'USDT0'];
 
 // ─── Token Icon ─────────────────────────────────────────
 
@@ -164,6 +201,21 @@ function TokenDropdown({
                     SOON
                   </span>
                 )}
+                {!isComingSoon && token.verified === false && (
+                  // Venue-discovered listing (not curated) — verify the
+                  // issuer before trading unfamiliar tokens.
+                  <span style={{
+                    fontSize: '10px',
+                    fontWeight: 600,
+                    color: '#8a8f9c',
+                    background: 'rgba(138, 143, 156, 0.12)',
+                    padding: '2px 6px',
+                    borderRadius: '4px',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    DEX
+                  </span>
+                )}
               </button>
             );
           })}
@@ -285,7 +337,31 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   const [maxSlippageBps, setMaxSlippageBps] = useState(50); // 0.50% default
   const [autoRouteMinutes, setAutoRouteMinutes] = useState(0); // 0 = no timer
   const [oraclePrice, setOraclePrice] = useState<number | null>(null);
-  const { connected: walletConnected, address: walletAddress, connect: connectWallet } = useWallet();
+  const { connected: walletConnected, address: walletAddress, connect: connectWallet, signTransaction } = useWallet();
+
+  // Aggregated token universe from the backend (curated + venue-discovered).
+  // Falls back to the curated list if the API is unreachable.
+  const [allTokens, setAllTokens] = useState<Token[]>(TOKENS);
+  useEffect(() => {
+    import('@/lib/api').then(({ getAssets }) =>
+      getAssets().then((assets) => {
+        if (Array.isArray(assets) && assets.length > 0) {
+          setAllTokens(assets.map(assetToToken));
+        }
+      })
+    ).catch(() => {});
+  }, []);
+
+  const p2pTokens = allTokens.filter((t) => P2P_ALLOWED.includes(t.symbol));
+  const p2pLive = (symbol: string) =>
+    p2pTokens.find((t) => t.symbol === symbol)?.status === 'live';
+
+  // Prefer SAC addresses when calling the API — discovered tokens aren't
+  // resolvable by symbol on the backend.
+  const tokenParam = useCallback(
+    (symbol: string) => allTokens.find((t) => t.symbol === symbol)?.sacAddress || symbol,
+    [allTokens]
+  );
 
   // Determine if either side is a volatile asset (needs oracle pricing)
   const isVolatilePair = tokenIn === 'SolvBTC' || tokenOut === 'SolvBTC';
@@ -317,7 +393,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         try {
           setLoading(true);
           const baseAmount = Math.floor(parseFloat(amount) * 1e7).toString();
-          const data = await fetchQuote(tIn, tOut, baseAmount);
+          const data = await fetchQuote(tokenParam(tIn), tokenParam(tOut), baseAmount);
           setQuote(data);
           onRouteComputed(data);
         } catch (error) {
@@ -327,7 +403,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         }
       }, 400); // 400ms debounce
     },
-    [onRouteComputed]
+    [onRouteComputed, tokenParam]
   );
 
   // Trigger auto-quote when amount/tokens change in instant mode
@@ -387,14 +463,11 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
       });
 
       if (data.xdrs && data.xdrs.length > 0) {
-        // Sign each transaction with Freighter
-        const freighter = await import('@stellar/freighter-api');
+        // Sign each transaction via the wallet context (enforces the
+        // app's expected network before every signature)
+        const { submitTransaction } = await import('@/lib/api');
         for (const xdrStr of data.xdrs) {
-          const signed = await freighter.signTransaction(xdrStr, {
-            networkPassphrase: 'Test SDF Network ; September 2015',
-          });
-          // Submit signed transaction
-          const { submitTransaction } = await import('@/lib/api');
+          const signed = await signTransaction(xdrStr);
           await submitTransaction(signed);
         }
         alert('Order placed successfully! Check the Orders tab to see it.');
@@ -409,7 +482,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     } finally {
       setSubmitting(false);
     }
-  }, [walletAddress, p2pPlan, amountIn, tokenIn, tokenOut, priceMode, maxSlippageBps, autoRouteMinutes]);
+  }, [walletAddress, p2pPlan, amountIn, tokenIn, tokenOut, priceMode, maxSlippageBps, autoRouteMinutes, signTransaction]);
 
   // Handle instant swap execution
   const handleInstantSwap = useCallback(async () => {
@@ -450,7 +523,21 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         ]).map((tab) => (
           <button
             key={tab.key}
-            onClick={() => { setMode(tab.key); setQuote(null); setP2pPlan(null); }}
+            onClick={() => {
+              setMode(tab.key);
+              setQuote(null);
+              setP2pPlan(null);
+              if (tab.key === 'p2p') {
+                // Coerce selections into the P2P corridor
+                const nextIn = P2P_ALLOWED.includes(tokenIn) ? tokenIn : 'USDC';
+                const nextOut =
+                  P2P_ALLOWED.includes(tokenOut) && tokenOut !== nextIn
+                    ? tokenOut
+                    : nextIn === 'USDC' ? 'USDT0' : 'USDC';
+                setTokenIn(nextIn);
+                setTokenOut(nextOut);
+              }
+            }}
             style={{
               flex: 1,
               padding: '14px 16px 12px',
@@ -479,7 +566,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           value={amountIn}
           onChange={(v) => { setAmountIn(v); setP2pPlan(null); }}
           token={tokenIn}
-          tokens={TOKENS}
+          tokens={mode === 'p2p' ? p2pTokens : allTokens}
           onTokenSelect={(s) => { setTokenIn(s); if (s === tokenOut) setTokenOut(tokenIn); setQuote(null); setP2pPlan(null); }}
           excludeToken={tokenOut}
           accent="#ef4444"
@@ -525,7 +612,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           }
           readOnly
           token={tokenOut}
-          tokens={TOKENS}
+          tokens={mode === 'p2p' ? p2pTokens : allTokens}
           onTokenSelect={(s) => { setTokenOut(s); if (s === tokenIn) setTokenIn(tokenOut); setQuote(null); setP2pPlan(null); }}
           excludeToken={tokenIn}
           accent="#22c55e"
@@ -765,7 +852,9 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         {/* Action button */}
         {(() => {
           const hasAmount = amountIn && parseFloat(amountIn) > 0;
-          const disabled = !hasAmount || loading || submitting;
+          const p2pPairReady =
+            mode !== 'p2p' || (p2pLive(tokenIn) && p2pLive(tokenOut));
+          const disabled = !hasAmount || loading || submitting || !p2pPairReady;
 
           // Determine button action and label
           let onClick: (() => void) | undefined;
@@ -789,7 +878,9 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
               label = 'Fetching quote...';
             }
           } else if (mode === 'p2p') {
-            if (!hasAmount) {
+            if (!p2pPairReady) {
+              label = `${tokenIn === 'USDT0' || tokenOut === 'USDT0' ? 'USDT0' : 'Pair'} not live yet — P2P opens at launch`;
+            } else if (!hasAmount) {
               label = 'Enter an amount';
             } else if (!p2pPlan) {
               onClick = handleP2pCheck;

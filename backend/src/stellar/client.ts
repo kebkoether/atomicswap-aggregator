@@ -4,7 +4,7 @@
  * Uses @stellar/stellar-sdk to:
  * - Simulate contract calls (for quotes, no gas cost)
  * - Build and submit real transactions (for swaps)
- * - Query contract state
+ * - Sign and submit service transactions (keeper / oracle)
  */
 
 import {
@@ -22,18 +22,37 @@ import {
 export interface StellarClientConfig {
   rpcUrl: string;
   networkPassphrase: string;
-  adminKeypair?: InstanceType<typeof Keypair>;
+}
+
+/** How long to poll for a submitted transaction before giving up. */
+const SUBMIT_POLL_ATTEMPTS = 30;
+const SUBMIT_POLL_INTERVAL_MS = 1000;
+
+/**
+ * Soroban unit-variant enums decode via scValToNative as one-element
+ * arrays (e.g. ['Open']), not bare strings. Normalize before comparing.
+ */
+export function scEnum(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value) && value.length > 0 && typeof value[0] === 'string') {
+    return value[0];
+  }
+  return String(value);
 }
 
 export class StellarClient {
   private server: rpc.Server;
   private networkPassphrase: string;
-  private adminKeypair?: InstanceType<typeof Keypair>;
 
   constructor(config: StellarClientConfig) {
     this.server = new rpc.Server(config.rpcUrl);
     this.networkPassphrase = config.networkPassphrase;
-    this.adminKeypair = config.adminKeypair;
+  }
+
+  /** Latest ledger sequence — needed to compute expiry / timer offsets. */
+  async getLatestLedger(): Promise<number> {
+    const response = await this.server.getLatestLedger();
+    return response.sequence;
   }
 
   /**
@@ -49,8 +68,8 @@ export class StellarClient {
       const contract = new Contract(contractId);
       const operation = contract.call(method, ...args);
 
-      // Build a throwaway transaction just for simulation
-      const account = await this.getTransientAccount();
+      // Simulation doesn't need a real account
+      const account = new Account(Keypair.random().publicKey(), '0');
       const tx = new TransactionBuilder(account, {
         fee: '100',
         networkPassphrase: this.networkPassphrase,
@@ -62,8 +81,7 @@ export class StellarClient {
       const simResult = await this.server.simulateTransaction(tx);
 
       if (rpc.Api.isSimulationSuccess(simResult)) {
-        const resultVal = simResult.result?.retval;
-        return resultVal ?? null;
+        return simResult.result?.retval ?? null;
       }
 
       console.warn(`Simulation failed for ${contractId}.${method}`);
@@ -116,7 +134,9 @@ export class StellarClient {
     const simResult = await this.server.simulateTransaction(tx);
 
     if (!rpc.Api.isSimulationSuccess(simResult)) {
-      throw new Error(`Transaction simulation failed`);
+      const detail =
+        'error' in simResult ? ` — ${JSON.stringify(simResult.error)}` : '';
+      throw new Error(`Transaction simulation failed${detail}`);
     }
 
     const preparedTx = rpc.assembleTransaction(tx, simResult);
@@ -124,7 +144,29 @@ export class StellarClient {
   }
 
   /**
-   * Submit a signed transaction XDR.
+   * Build, sign, and submit a contract call from a service account
+   * (keeper sweep, oracle updates). Returns the final tx response.
+   */
+  async submitWithSigner(
+    signer: InstanceType<typeof Keypair>,
+    contractId: string,
+    method: string,
+    args: xdr.ScVal[]
+  ): Promise<rpc.Api.GetTransactionResponse> {
+    const unsignedXdr = await this.buildTransaction(
+      signer.publicKey(),
+      contractId,
+      method,
+      args
+    );
+    const tx = TransactionBuilder.fromXDR(unsignedXdr, this.networkPassphrase);
+    tx.sign(signer);
+    return this.submitTransaction(tx.toXDR());
+  }
+
+  /**
+   * Submit a signed transaction XDR. Polls for the result with a bounded
+   * timeout — a hung RPC must not hang the request handler forever.
    */
   async submitTransaction(signedXdr: string): Promise<rpc.Api.GetTransactionResponse> {
     const tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
@@ -134,14 +176,16 @@ export class StellarClient {
       throw new Error(`Transaction send failed: ${JSON.stringify(response)}`);
     }
 
-    // Poll for result
-    let getResponse = await this.server.getTransaction(response.hash);
-    while (getResponse.status === 'NOT_FOUND') {
-      await new Promise((r) => setTimeout(r, 1000));
-      getResponse = await this.server.getTransaction(response.hash);
+    for (let attempt = 0; attempt < SUBMIT_POLL_ATTEMPTS; attempt++) {
+      const getResponse = await this.server.getTransaction(response.hash);
+      if (getResponse.status !== 'NOT_FOUND') {
+        return getResponse;
+      }
+      await new Promise((r) => setTimeout(r, SUBMIT_POLL_INTERVAL_MS));
     }
-
-    return getResponse;
+    throw new Error(
+      `Transaction ${response.hash} not confirmed after ${SUBMIT_POLL_ATTEMPTS}s — check the explorer before retrying`
+    );
   }
 
   // ─── Helper: ScVal builders ───────────────────────────
@@ -158,23 +202,35 @@ export class StellarClient {
     return nativeToScVal(value, { type: 'u32' });
   }
 
-  static toU64(value: number): xdr.ScVal {
+  static toU64(value: number | bigint): xdr.ScVal {
     return nativeToScVal(value, { type: 'u64' });
   }
 
-  // ─── Internal ─────────────────────────────────────────
-
-  private async getTransientAccount(): Promise<Account> {
-    if (this.adminKeypair) {
-      try {
-        return await this.server.getAccount(this.adminKeypair.publicKey());
-      } catch {
-        // fallthrough
-      }
-    }
-
-    // Use a random keypair for simulation
-    const randomKp = Keypair.random();
-    return new Account(randomKp.publicKey(), '0');
+  /**
+   * Encode Vec<RouteSegment> for the Router contract.
+   * Struct fields encode as an ScMap with keys in lexicographic order:
+   * amount_in < min_amount_out < venue_id.
+   */
+  static toRouteSegments(
+    segments: Array<{ venueId: number; amountIn: bigint; minAmountOut: bigint }>
+  ): xdr.ScVal {
+    return xdr.ScVal.scvVec(
+      segments.map((seg) =>
+        xdr.ScVal.scvMap([
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol('amount_in'),
+            val: nativeToScVal(seg.amountIn, { type: 'i128' }),
+          }),
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol('min_amount_out'),
+            val: nativeToScVal(seg.minAmountOut, { type: 'i128' }),
+          }),
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol('venue_id'),
+            val: nativeToScVal(seg.venueId, { type: 'u32' }),
+          }),
+        ])
+      )
+    );
   }
 }

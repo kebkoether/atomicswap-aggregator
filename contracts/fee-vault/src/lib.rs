@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror,
-    token, Address, Env, log,
+    symbol_short, token, Address, Env,
 };
 
 // ─── Storage Keys ───────────────────────────────────────
@@ -10,10 +10,6 @@ use soroban_sdk::{
 #[contracttype]
 pub enum DataKey {
     Admin,
-    /// Balance of a specific token held in the vault
-    Balance(Address),
-    /// Addresses authorized to deposit (SwapBook, Router contracts)
-    Depositor(Address),
 }
 
 #[contracterror]
@@ -28,109 +24,54 @@ pub enum FeeVaultError {
 }
 
 // ─── Contract ───────────────────────────────────────────
+//
+// Fee tokens are transferred directly to this contract's address by the
+// SwapBook and Router contracts. The vault's balance IS the token balance —
+// there is deliberately no shadow accounting to drift out of sync.
 
 #[contract]
 pub struct FeeVault;
 
 #[contractimpl]
 impl FeeVault {
-    /// Initialize the vault with an admin address.
-    pub fn initialize(env: Env, admin: Address) -> Result<(), FeeVaultError> {
-        if env.storage().instance().has(&DataKey::Admin) {
-            return Err(FeeVaultError::AlreadyInitialized);
-        }
+    /// Deploy-time constructor — atomic with deployment, cannot be front-run.
+    pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
-        Ok(())
-    }
-
-    /// Authorize an address to deposit fees (e.g., SwapBook or Router).
-    /// Admin only.
-    pub fn authorize_depositor(
-        env: Env,
-        admin: Address,
-        depositor: Address,
-    ) -> Result<(), FeeVaultError> {
-        admin.require_auth();
-        Self::require_admin(&env, &admin)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Depositor(depositor), &true);
-        Ok(())
-    }
-
-    /// Record a fee deposit. The actual token transfer happens in the calling
-    /// contract (SwapBook/Router transfers directly to this vault address).
-    /// This function just updates the internal accounting.
-    pub fn record_deposit(
-        env: Env,
-        token: Address,
-        amount: i128,
-    ) -> Result<(), FeeVaultError> {
-        if amount <= 0 {
-            return Err(FeeVaultError::InvalidAmount);
-        }
-
-        let balance_key = DataKey::Balance(token.clone());
-        let current: i128 = env
-            .storage()
-            .persistent()
-            .get(&balance_key)
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&balance_key, &(current + amount));
-
-        log!(&env, "Fee deposited: token={}, amount={}", token, amount);
-
-        Ok(())
     }
 
     /// Withdraw accumulated fees. Admin only.
     pub fn withdraw(
         env: Env,
-        admin: Address,
         token: Address,
         amount: i128,
         to: Address,
     ) -> Result<(), FeeVaultError> {
-        admin.require_auth();
-        Self::require_admin(&env, &admin)?;
+        Self::require_admin(&env)?;
 
         if amount <= 0 {
             return Err(FeeVaultError::InvalidAmount);
         }
 
-        let balance_key = DataKey::Balance(token.clone());
-        let current: i128 = env
-            .storage()
-            .persistent()
-            .get(&balance_key)
-            .unwrap_or(0);
-
-        if amount > current {
+        let token_client = token::Client::new(&env, &token);
+        let balance = token_client.balance(&env.current_contract_address());
+        if amount > balance {
             return Err(FeeVaultError::InsufficientBalance);
         }
 
-        // Transfer tokens out
-        let token_client = token::Client::new(&env, &token);
         token_client.transfer(&env.current_contract_address(), &to, &amount);
 
-        // Update accounting
-        env.storage()
-            .persistent()
-            .set(&balance_key, &(current - amount));
-
-        log!(&env, "Fee withdrawn: token={}, amount={}, to={}", token, amount, to);
-
+        env.events().publish(
+            (symbol_short!("fees"), symbol_short!("withdraw")),
+            (token, amount, to),
+        );
         Ok(())
     }
 
-    /// Query the fee balance for a given token.
+    /// Query the fee balance for a given token — the actual token balance
+    /// held by this contract.
     pub fn get_balance(env: Env, token: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Balance(token))
-            .unwrap_or(0)
+        let token_client = token::Client::new(&env, &token);
+        token_client.balance(&env.current_contract_address())
     }
 
     /// Get the admin address.
@@ -141,17 +82,29 @@ impl FeeVault {
             .ok_or(FeeVaultError::NotInitialized)
     }
 
+    /// Transfer admin to a new address. Admin only.
+    pub fn set_admin(env: Env, new_admin: Address) -> Result<(), FeeVaultError> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("set")),
+            new_admin,
+        );
+        Ok(())
+    }
+
     // ─── Internal ───────────────────────────────────────
 
-    fn require_admin(env: &Env, caller: &Address) -> Result<(), FeeVaultError> {
+    fn require_admin(env: &Env) -> Result<(), FeeVaultError> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(FeeVaultError::NotInitialized)?;
-        if *caller != admin {
-            return Err(FeeVaultError::Unauthorized);
-        }
+        admin.require_auth();
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod test;

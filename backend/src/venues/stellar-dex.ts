@@ -22,6 +22,8 @@ import { Horizon, Asset } from '@stellar/stellar-sdk';
 export class StellarDexAdapter implements VenueAdapter {
   readonly name = 'StellarDEX';
   readonly venueId = 3; // 0=SwapBook, 1=Aqua, 2=Sushi, 3=SDEX
+  // SDEX legs are classic path_payment ops, not Router-executable contracts.
+  readonly executable = false;
 
   private horizon: Horizon.Server;
 

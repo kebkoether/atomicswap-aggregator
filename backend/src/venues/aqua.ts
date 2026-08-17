@@ -16,6 +16,7 @@ import { StellarClient } from '../stellar/client.js';
 export class AquaAdapter implements VenueAdapter {
   readonly name = 'Aqua';
   readonly venueId = 1;
+  readonly executable = true;
   private stellar: StellarClient;
 
   constructor(

@@ -2,458 +2,438 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger, LedgerInfo},
+    testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
     token::{StellarAssetClient, TokenClient},
-    Env,
+    Env, IntoVal,
 };
 
-fn setup_test() -> (Env, Address, Address, Address, Address, Address) {
+struct TestCtx {
+    env: Env,
+    contract_id: Address,
+    admin: Address,
+    fee_vault: Address,
+    token_a: Address,
+    token_b: Address,
+    maker: Address,
+    taker: Address,
+}
+
+fn setup() -> TestCtx {
     let env = Env::default();
     env.mock_all_auths();
-
-    // Set ledger sequence
-    env.ledger().set(LedgerInfo {
-        timestamp: 1000,
-        protocol_version: 20,
-        sequence_number: 100,
-        network_id: Default::default(),
-        base_reserve: 10,
-        min_temp_entry_ttl: 100_000,
-        min_persistent_entry_ttl: 100_000,
-        max_entry_ttl: 3_110_400,
+    env.ledger().with_mut(|li| {
+        li.sequence_number = 100;
+        li.timestamp = 1000;
     });
 
     let admin = Address::generate(&env);
+    let fee_vault = Address::generate(&env);
     let maker = Address::generate(&env);
     let taker = Address::generate(&env);
 
-    // Deploy token contracts (simulating USDC and PYUSD)
     let token_a_admin = Address::generate(&env);
-    let token_a = env.register_stellar_asset_contract_v2(token_a_admin.clone());
-    let token_a_client = StellarAssetClient::new(&env, &token_a.address());
-    token_a_client.mint(&maker, &1_000_000_0000000); // 1M with 7 decimals
-    token_a_client.mint(&taker, &1_000_000_0000000);
+    let token_a = env
+        .register_stellar_asset_contract_v2(token_a_admin)
+        .address();
+    StellarAssetClient::new(&env, &token_a).mint(&maker, &1_000_000_0000000);
+    StellarAssetClient::new(&env, &token_a).mint(&taker, &1_000_000_0000000);
 
     let token_b_admin = Address::generate(&env);
-    let token_b = env.register_stellar_asset_contract_v2(token_b_admin.clone());
-    let token_b_client = StellarAssetClient::new(&env, &token_b.address());
-    token_b_client.mint(&maker, &1_000_000_0000000);
-    token_b_client.mint(&taker, &1_000_000_0000000);
+    let token_b = env
+        .register_stellar_asset_contract_v2(token_b_admin)
+        .address();
+    StellarAssetClient::new(&env, &token_b).mint(&maker, &1_000_000_0000000);
+    StellarAssetClient::new(&env, &token_b).mint(&taker, &1_000_000_0000000);
 
-    // Deploy fee vault (just use a regular address for testing)
-    let fee_vault = Address::generate(&env);
+    let contract_id = env.register(SwapBook, (admin.clone(), fee_vault.clone()));
 
-    // Deploy SwapBook
-    let contract_id = env.register_contract(None, SwapBook);
-    let client = SwapBookClient::new(&env, &contract_id);
-    client.initialize(&admin, &fee_vault);
-
-    (env, contract_id, token_a.address(), token_b.address(), maker, taker)
+    TestCtx {
+        env,
+        contract_id,
+        admin,
+        fee_vault,
+        token_a,
+        token_b,
+        maker,
+        taker,
+    }
 }
 
-// ─── Fixed-Price Order Tests (backward-compat) ────────────
-
-#[test]
-fn test_place_order() {
-    let (env, contract_id, token_a, token_b, maker, _taker) = setup_test();
-    let client = SwapBookClient::new(&env, &contract_id);
-
-    let order_id = client.place_order(
-        &maker,
-        &token_a,
-        &token_b,
-        &10_000_0000000,    // 10,000 token_a
-        &9_999_5000000,     // min 9,999.5 token_b (0.5 bps spread)
-        &200,               // expires at ledger 200
-        &0,                 // Fixed price mode
-        &0,                 // no slippage (N/A for fixed)
-        &0,                 // no auto-route timer
-    );
-
-    assert_eq!(order_id, 1);
-
-    let order = client.get_order(&order_id);
-    assert_eq!(order.maker, maker);
-    assert_eq!(order.amount_in, 10_000_0000000);
-    assert_eq!(order.amount_in_remaining, 10_000_0000000);
-    assert_eq!(order.status, OrderStatus::Open);
-    assert_eq!(order.price_mode, PriceMode::Fixed);
-    assert_eq!(order.auto_route_after, 0);
-
-    // Verify tokens were escrowed
-    let token_a_client = TokenClient::new(&env, &token_a);
-    assert_eq!(
-        token_a_client.balance(&maker),
-        1_000_000_0000000 - 10_000_0000000
-    );
-    assert_eq!(token_a_client.balance(&contract_id), 10_000_0000000);
+fn advance_to(env: &Env, seq: u32) {
+    env.ledger().with_mut(|li| li.sequence_number = seq);
 }
 
+// ─── Fixed-Price Order Tests ──────────────────────────
+
 #[test]
-fn test_fill_order() {
-    let (env, contract_id, token_a, token_b, maker, taker) = setup_test();
-    let client = SwapBookClient::new(&env, &contract_id);
+fn test_place_order_escrows_tokens() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
 
     let order_id = client.place_order(
-        &maker, &token_a, &token_b,
+        &t.maker, &t.token_a, &t.token_b,
         &10_000_0000000, &9_999_5000000, &200,
         &0, &0, &0,
     );
+    assert_eq!(order_id, 1);
 
-    // Taker fills the order
-    client.fill_order(&taker, &order_id, &10_000_0000000);
+    let order = client.get_order(&order_id);
+    assert_eq!(order.maker, t.maker);
+    assert_eq!(order.amount_in_remaining, 10_000_0000000);
+    assert_eq!(order.status, OrderStatus::Open);
 
-    // Check order is filled
+    let token_a = TokenClient::new(&t.env, &t.token_a);
+    assert_eq!(token_a.balance(&t.maker), 1_000_000_0000000 - 10_000_0000000);
+    assert_eq!(token_a.balance(&t.contract_id), 10_000_0000000);
+}
+
+#[test]
+fn test_fill_order_pays_maker_and_fee() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+
+    let order_id = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &10_000_0000000, &9_999_5000000, &200,
+        &0, &0, &0,
+    );
+    client.fill_order(&t.taker, &order_id, &10_000_0000000);
+
     let order = client.get_order(&order_id);
     assert_eq!(order.status, OrderStatus::Filled);
     assert_eq!(order.amount_in_remaining, 0);
 
-    // Check balances
-    let token_a_client = TokenClient::new(&env, &token_a);
-    let token_b_client = TokenClient::new(&env, &token_b);
+    let token_a = TokenClient::new(&t.env, &t.token_a);
+    let token_b = TokenClient::new(&t.env, &t.token_b);
 
-    // Taker received 10,000 token_a
-    assert_eq!(
-        token_a_client.balance(&taker),
-        1_000_000_0000000 + 10_000_0000000
-    );
+    assert_eq!(token_a.balance(&t.taker), 1_000_000_0000000 + 10_000_0000000);
 
-    // Maker received token_b minus 0.5bps fee
-    let fee = (10_000_0000000i128 * 5) / 100_000;
-    let maker_receives = 10_000_0000000 - fee;
+    // fee = ceil(10_000_0000000 * 5 / 100_000) = 5_000_000
+    let fee = 5_000_000i128;
     assert_eq!(
-        token_b_client.balance(&maker),
-        1_000_000_0000000 + maker_receives
+        token_b.balance(&t.maker),
+        1_000_000_0000000 + 10_000_0000000 - fee
     );
+    assert_eq!(token_b.balance(&t.fee_vault), fee);
 }
 
 #[test]
-fn test_partial_fill() {
-    let (env, contract_id, token_a, token_b, maker, taker) = setup_test();
-    let client = SwapBookClient::new(&env, &contract_id);
+fn test_partial_fill_and_index_retained() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
 
     let order_id = client.place_order(
-        &maker, &token_a, &token_b,
+        &t.maker, &t.token_a, &t.token_b,
         &10_000_0000000, &9_999_5000000, &200,
         &0, &0, &0,
     );
-
-    // Taker fills half the order
-    client.partial_fill(&taker, &order_id, &5_000_0000000, &5_000_0000000);
+    client.partial_fill(&t.taker, &order_id, &5_000_0000000, &5_000_0000000);
 
     let order = client.get_order(&order_id);
     assert_eq!(order.status, OrderStatus::PartialFill);
     assert_eq!(order.amount_in_remaining, 5_000_0000000);
-
-    // Pair index should still contain this order
-    let orders = client.get_orders(&token_a, &token_b);
-    assert_eq!(orders.len(), 1);
+    assert_eq!(client.get_orders(&t.token_a, &t.token_b).len(), 1);
 }
 
 #[test]
-fn test_cancel_order() {
-    let (env, contract_id, token_a, token_b, maker, _taker) = setup_test();
-    let client = SwapBookClient::new(&env, &contract_id);
+fn test_partial_fill_underpayment_rejected() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
 
     let order_id = client.place_order(
-        &maker, &token_a, &token_b,
+        &t.maker, &t.token_a, &t.token_b,
+        &10_000_0000000, &9_999_5000000, &200,
+        &0, &0, &0,
+    );
+    // Exact pro-rata for half = ceil(9_999_5000000 / 2) = 4_999_7500000
+    // One stroop below must be rejected.
+    let res = client.try_partial_fill(&t.taker, &order_id, &5_000_0000000, &4_999_7499999);
+    assert!(res.is_err());
+    // Exact amount succeeds
+    client.partial_fill(&t.taker, &order_id, &5_000_0000000, &4_999_7500000);
+}
+
+#[test]
+fn test_dust_fill_cannot_round_to_free() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+
+    // Cross-price order: 62,000 A for 1 B (per-unit price ≪ 1).
+    // Old floor math let fills below 62,000 stroops round required_out to 0.
+    let order_id = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &62_000_0000000, &1_0000000, &200,
+        &0, &0, &0,
+    );
+
+    // Paying zero is always rejected
+    assert!(client.try_partial_fill(&t.taker, &order_id, &61_999, &0).is_err());
+    // Ceiling math demands at least 1 stroop for any nonzero fill
+    client.partial_fill(&t.taker, &order_id, &61_999, &1);
+}
+
+#[test]
+fn test_cancel_order_refunds() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+
+    let order_id = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &10_000_0000000, &9_999_5000000, &200,
+        &0, &0, &0,
+    );
+    client.cancel_order(&order_id);
+
+    assert_eq!(client.get_order(&order_id).status, OrderStatus::Cancelled);
+    assert_eq!(
+        TokenClient::new(&t.env, &t.token_a).balance(&t.maker),
+        1_000_000_0000000
+    );
+    assert_eq!(client.get_orders(&t.token_a, &t.token_b).len(), 0);
+}
+
+#[test]
+fn test_cancel_requires_maker_auth() {
+    let t = setup();
+    // Mock ONLY the taker's auth — maker's require_auth must then fail.
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+    let order_id = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
         &10_000_0000000, &9_999_5000000, &200,
         &0, &0, &0,
     );
 
-    client.cancel_order(&maker, &order_id);
-
-    let order = client.get_order(&order_id);
-    assert_eq!(order.status, OrderStatus::Cancelled);
-
-    // Tokens returned to maker
-    let token_a_client = TokenClient::new(&env, &token_a);
-    assert_eq!(token_a_client.balance(&maker), 1_000_000_0000000);
-
-    // Removed from pair index
-    let orders = client.get_orders(&token_a, &token_b);
-    assert_eq!(orders.len(), 0);
+    t.env.set_auths(&[]);
+    t.env.mock_auths(&[MockAuth {
+        address: &t.taker,
+        invoke: &MockAuthInvoke {
+            contract: &t.contract_id,
+            fn_name: "cancel_order",
+            args: (order_id,).into_val(&t.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_cancel_order(&order_id).is_err());
 }
 
 #[test]
-fn test_multiple_orders_and_best_offer() {
-    let (env, contract_id, token_a, token_b, maker, _taker) = setup_test();
-    let client = SwapBookClient::new(&env, &contract_id);
-
-    // Place two orders at different prices
-    let _id1 = client.place_order(
-        &maker, &token_a, &token_b,
-        &5_000_0000000, &4_999_0000000, &200,
-        &0, &0, &0,
-    );
-    let _id2 = client.place_order(
-        &maker, &token_a, &token_b,
-        &5_000_0000000, &4_999_7500000, &200,
-        &0, &0, &0,
-    );
-
-    let orders = client.get_orders(&token_a, &token_b);
-    assert_eq!(orders.len(), 2);
-
-    let best = client.get_best_offer(&token_a, &token_b, &3_000_0000000);
-    assert!(best > 0);
-}
-
-#[test]
-#[should_panic]
-fn test_fill_expired_order() {
-    let (env, contract_id, token_a, token_b, maker, taker) = setup_test();
-    let client = SwapBookClient::new(&env, &contract_id);
+fn test_expire_order_refunds_maker() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
 
     let order_id = client.place_order(
-        &maker, &token_a, &token_b,
+        &t.maker, &t.token_a, &t.token_b,
         &10_000_0000000, &9_999_5000000, &150,
         &0, &0, &0,
     );
 
-    // Advance ledger past expiry
-    env.ledger().set(LedgerInfo {
-        timestamp: 2000,
-        protocol_version: 20,
-        sequence_number: 200,
-        network_id: Default::default(),
-        base_reserve: 10,
-        min_temp_entry_ttl: 100_000,
-        min_persistent_entry_ttl: 100_000,
-        max_entry_ttl: 3_110_400,
-    });
+    // Not yet expired
+    assert!(client.try_expire_order(&order_id).is_err());
 
-    client.fill_order(&taker, &order_id, &10_000_0000000);
+    advance_to(&t.env, 200);
+    client.expire_order(&order_id);
+
+    assert_eq!(client.get_order(&order_id).status, OrderStatus::Expired);
+    assert_eq!(
+        TokenClient::new(&t.env, &t.token_a).balance(&t.maker),
+        1_000_000_0000000
+    );
+    assert_eq!(client.get_orders(&t.token_a, &t.token_b).len(), 0);
 }
 
 #[test]
-#[should_panic]
-fn test_cancel_by_non_maker() {
-    let (env, contract_id, token_a, token_b, maker, taker) = setup_test();
-    let client = SwapBookClient::new(&env, &contract_id);
+fn test_fill_expired_order_rejected() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
 
     let order_id = client.place_order(
-        &maker, &token_a, &token_b,
+        &t.maker, &t.token_a, &t.token_b,
+        &10_000_0000000, &9_999_5000000, &150,
+        &0, &0, &0,
+    );
+    advance_to(&t.env, 200);
+    assert!(client.try_fill_order(&t.taker, &order_id, &10_000_0000000).is_err());
+}
+
+// ─── quote_fill (taker-direction quoting) ─────────────
+
+#[test]
+fn test_quote_fill_taker_direction() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+
+    // Maker sells 10,000 A, wants >= 9,999.5 B
+    client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
         &10_000_0000000, &9_999_5000000, &200,
         &0, &0, &0,
     );
 
-    client.cancel_order(&taker, &order_id);
+    // Taker pays 5,000 B to buy A
+    let (bought, paid) = client.quote_fill(&t.token_a, &t.token_b, &5_000_0000000);
+    assert!(paid <= 5_000_0000000);
+    // At 0.5 bps under par, 5,000 B buys slightly MORE than 5,000 A
+    assert!(bought > 5_000_0000000);
+    assert!(bought <= 10_000_0000000);
+
+    // Empty reverse side quotes zero
+    let (bought_rev, paid_rev) = client.quote_fill(&t.token_b, &t.token_a, &5_000_0000000);
+    assert_eq!(bought_rev, 0);
+    assert_eq!(paid_rev, 0);
 }
 
-// ─── Oracle Price Mode Tests ──────────────────────────
+// ─── Oracle Price Mode ────────────────────────────────
+
+fn setup_oracle(t: &TestCtx) -> (SwapBookClient<'_>, Address) {
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+    let oracle_admin = Address::generate(&t.env);
+    client.set_oracle_admin(&oracle_admin);
+    // 1 A = 62,000 B
+    client.update_oracle_price(&t.token_a, &t.token_b, &62_000, &1);
+    (client, oracle_admin)
+}
 
 #[test]
 fn test_oracle_order_fill() {
-    let (env, contract_id, token_a, token_b, maker, taker) = setup_test();
-    let client = SwapBookClient::new(&env, &contract_id);
+    let t = setup();
+    let (client, _) = setup_oracle(&t);
 
-    // Set up oracle admin and price
-    // token_a = BTC (7 decimals), token_b = USDC (7 decimals)
-    // Price: 1 BTC = 62,000 USDC
-    let admin = Address::generate(&env);
-    // Re-initialize with admin (for simplicity, use a fresh contract)
-    let contract_id2 = env.register_contract(None, SwapBook);
-    let client2 = SwapBookClient::new(&env, &contract_id2);
-    let oracle_admin = Address::generate(&env);
-    let fee_vault = Address::generate(&env);
-    client2.initialize(&admin, &fee_vault);
-    client2.set_oracle_admin(&admin, &oracle_admin);
-
-    // Set oracle price: 1 token_a = 62,000 token_b
-    // fair_value = fill_amount_in * num / den
-    // For 1 BTC (1_0000000 raw) → 62000 USDC (62000_0000000 raw):
-    // num/den ratio must equal 62000_0000000 / 1_0000000 = 62000
-    client2.update_oracle_price(
-        &oracle_admin,
-        &token_a,
-        &token_b,
-        &62_000, // price numerator
-        &1,      // price denominator
-    );
-
-    // Mint tokens to use with new contract
-    let token_a_sac = StellarAssetClient::new(&env, &token_a);
-    let token_b_sac = StellarAssetClient::new(&env, &token_b);
-    token_a_sac.mint(&maker, &10_0000000);   // 10 BTC
-    token_b_sac.mint(&taker, &700_000_0000000); // 700k USDC
-
-    // Place oracle-pegged order: 1 BTC, max 50 bps slippage
-    let order_id = client2.place_order(
-        &maker,
-        &token_a,
-        &token_b,
-        &1_0000000,     // 1 BTC
-        &0,             // min_amount_out ignored for oracle mode
-        &500,           // expiry ledger 500
-        &1,             // Oracle price mode
-        &50,            // 50 bps = 0.50% max slippage
-        &0,             // no auto-route timer
-    );
-
-    assert_eq!(order_id, 1);
-    let order = client2.get_order(&order_id);
-    assert_eq!(order.price_mode, PriceMode::Oracle);
-    assert_eq!(order.max_slippage_bps, 50);
-
-    // Taker fills at oracle price (62,000 USDC) — should succeed
-    client2.fill_order(&taker, &order_id, &62_000_0000000);
-
-    let order = client2.get_order(&order_id);
-    assert_eq!(order.status, OrderStatus::Filled);
-}
-
-#[test]
-#[should_panic]
-fn test_oracle_order_slippage_exceeded() {
-    let (env, contract_id, token_a, token_b, maker, taker) = setup_test();
-
-    let admin = Address::generate(&env);
-    let oracle_admin = Address::generate(&env);
-    let fee_vault = Address::generate(&env);
-    let contract_id2 = env.register_contract(None, SwapBook);
-    let client2 = SwapBookClient::new(&env, &contract_id2);
-    client2.initialize(&admin, &fee_vault);
-    client2.set_oracle_admin(&admin, &oracle_admin);
-
-    // Price: 1 token_a = 62,000 token_b
-    client2.update_oracle_price(
-        &oracle_admin,
-        &token_a, &token_b,
-        &62_000,
-        &1,
-    );
-
-    let token_a_sac = StellarAssetClient::new(&env, &token_a);
-    token_a_sac.mint(&maker, &10_0000000);
-
-    let order_id = client2.place_order(
-        &maker, &token_a, &token_b,
+    let order_id = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
         &1_0000000, &0, &500,
-        &1, &50, &0, // 50 bps max slippage
+        &1, &50, &0, // Oracle mode, 50 bps slippage
     );
 
-    // Taker tries to fill at 61,000 USDC (1.6% below oracle) — should fail
-    client2.fill_order(&taker, &order_id, &61_000_0000000);
+    // Fill at oracle fair value (62,000 B for 1 A)
+    client.fill_order(&t.taker, &order_id, &62_000_0000000);
+    assert_eq!(client.get_order(&order_id).status, OrderStatus::Filled);
 }
 
-// ─── Auto-Route Timer Tests ───────────────────────────
+#[test]
+fn test_oracle_slippage_exceeded() {
+    let t = setup();
+    let (client, _) = setup_oracle(&t);
+
+    let order_id = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &1_0000000, &0, &500,
+        &1, &50, &0,
+    );
+    // 61,000 is ~1.6% below fair — beyond 50 bps tolerance
+    assert!(client.try_fill_order(&t.taker, &order_id, &61_000_0000000).is_err());
+}
 
 #[test]
-fn test_auto_route_timer_claim() {
-    let (env, contract_id, token_a, token_b, maker, _taker) = setup_test();
-    let client = SwapBookClient::new(&env, &contract_id);
+fn test_oracle_price_validation() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+    let oracle_admin = Address::generate(&t.env);
+    client.set_oracle_admin(&oracle_admin);
 
-    let admin = Address::generate(&env);
-    let router = Address::generate(&env);
-    let fee_vault = Address::generate(&env);
-    let contract_id2 = env.register_contract(None, SwapBook);
-    let client2 = SwapBookClient::new(&env, &contract_id2);
-    client2.initialize(&admin, &fee_vault);
-    client2.set_router(&admin, &router);
+    // Zero / negative prices rejected
+    assert!(client.try_update_oracle_price(&t.token_a, &t.token_b, &0, &1).is_err());
+    assert!(client.try_update_oracle_price(&t.token_a, &t.token_b, &62_000, &0).is_err());
+    assert!(client.try_update_oracle_price(&t.token_a, &t.token_b, &-62_000, &1).is_err());
+}
 
-    let token_a_sac = StellarAssetClient::new(&env, &token_a);
-    token_a_sac.mint(&maker, &100_000_0000000);
+#[test]
+fn test_oracle_jump_capped() {
+    let t = setup();
+    let (client, _) = setup_oracle(&t); // price = 62,000
 
-    // Place order with auto_route_after = ledger 150
-    let order_id = client2.place_order(
-        &maker, &token_a, &token_b,
-        &10_000_0000000, &9_999_5000000, &500,
-        &0, &0, &150, // auto-route after ledger 150
+    // +19% is allowed
+    client.update_oracle_price(&t.token_a, &t.token_b, &73_780, &1);
+    // From 73,780, +25% must be rejected (cap is 20%)
+    assert!(client.try_update_oracle_price(&t.token_a, &t.token_b, &92_225, &1).is_err());
+    // A crash to ~zero must be rejected — this was the rug vector
+    assert!(client.try_update_oracle_price(&t.token_a, &t.token_b, &1, &1_000_000).is_err());
+}
+
+#[test]
+fn test_oracle_stale_price_rejected() {
+    let t = setup();
+    let (client, _) = setup_oracle(&t);
+
+    let order_id = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &1_0000000, &0, &5_000,
+        &1, &50, &0,
     );
 
-    let order = client2.get_order(&order_id);
-    assert_eq!(order.auto_route_after, 150);
+    // Advance past staleness window (1000 ledgers)
+    advance_to(&t.env, 100 + 1001 + 1);
+    assert!(client.try_fill_order(&t.taker, &order_id, &62_000_0000000).is_err());
+}
 
-    // Advance ledger past timer
-    env.ledger().set(LedgerInfo {
-        timestamp: 2000,
-        protocol_version: 20,
-        sequence_number: 200,
-        network_id: Default::default(),
-        base_reserve: 10,
-        min_temp_entry_ttl: 100_000,
-        min_persistent_entry_ttl: 100_000,
-        max_entry_ttl: 3_110_400,
-    });
+#[test]
+fn test_oracle_slippage_cap_enforced() {
+    let t = setup();
+    let (client, _) = setup_oracle(&t);
 
-    // Check expired timer query
-    let expired = client2.get_expired_timer_orders(&token_a, &token_b);
-    assert_eq!(expired.len(), 1);
+    // > MAX_SLIPPAGE_BPS (1000) rejected
+    let res = client.try_place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &1_0000000, &0, &500,
+        &1, &1001, &0,
+    );
+    assert!(res.is_err());
+    // 0 slippage in oracle mode also rejected
+    let res = client.try_place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &1_0000000, &0, &500,
+        &1, &0, &0,
+    );
+    assert!(res.is_err());
+}
 
-    // Router claims the order
-    let claimed_amount = client2.claim_expired_timer(&router, &order_id);
-    assert_eq!(claimed_amount, 10_000_0000000);
+// ─── Auto-Route Timer ─────────────────────────────────
 
-    // Order should be marked Routed
-    let order = client2.get_order(&order_id);
+#[test]
+fn test_timer_claim_returns_price_floor() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+    let router = Address::generate(&t.env);
+    client.set_router(&router);
+
+    let order_id = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
+        &10_000_0000000, &9_999_5000000, &500,
+        &0, &0, &150,
+    );
+
+    // Before the timer: not claimable
+    assert!(client.try_claim_expired_timer(&order_id).is_err());
+
+    advance_to(&t.env, 200);
+    assert_eq!(client.get_expired_timer_orders(&t.token_a, &t.token_b).len(), 1);
+
+    let claimed = client.claim_expired_timer(&order_id);
+    assert_eq!(claimed.maker, t.maker);
+    assert_eq!(claimed.amount, 10_000_0000000);
+    // Price floor = full min_amount_out (nothing was filled)
+    assert_eq!(claimed.min_out, 9_999_5000000);
+
+    let order = client.get_order(&order_id);
     assert_eq!(order.status, OrderStatus::Routed);
     assert_eq!(order.amount_in_remaining, 0);
-
-    // Router should have received the tokens
-    let token_a_client = TokenClient::new(&env, &token_a);
-    assert_eq!(token_a_client.balance(&router), 10_000_0000000);
+    assert_eq!(
+        TokenClient::new(&t.env, &t.token_a).balance(&router),
+        10_000_0000000
+    );
 }
 
 #[test]
-#[should_panic]
-fn test_auto_route_timer_not_expired() {
-    let (env, _contract_id, token_a, token_b, maker, _taker) = setup_test();
+fn test_timer_claim_no_timer_set() {
+    let t = setup();
+    let client = SwapBookClient::new(&t.env, &t.contract_id);
+    let router = Address::generate(&t.env);
+    client.set_router(&router);
 
-    let admin = Address::generate(&env);
-    let router = Address::generate(&env);
-    let fee_vault = Address::generate(&env);
-    let contract_id2 = env.register_contract(None, SwapBook);
-    let client2 = SwapBookClient::new(&env, &contract_id2);
-    client2.initialize(&admin, &fee_vault);
-    client2.set_router(&admin, &router);
-
-    let token_a_sac = StellarAssetClient::new(&env, &token_a);
-    token_a_sac.mint(&maker, &100_000_0000000);
-
-    let order_id = client2.place_order(
-        &maker, &token_a, &token_b,
+    let order_id = client.place_order(
+        &t.maker, &t.token_a, &t.token_b,
         &10_000_0000000, &9_999_5000000, &500,
-        &0, &0, &150,
+        &0, &0, &0, // no auto-route
     );
-
-    // Try to claim before timer expired (still at ledger 100) — should panic
-    client2.claim_expired_timer(&router, &order_id);
-}
-
-#[test]
-#[should_panic]
-fn test_auto_route_unauthorized_router() {
-    let (env, _contract_id, token_a, token_b, maker, taker) = setup_test();
-
-    let admin = Address::generate(&env);
-    let router = Address::generate(&env);
-    let fee_vault = Address::generate(&env);
-    let contract_id2 = env.register_contract(None, SwapBook);
-    let client2 = SwapBookClient::new(&env, &contract_id2);
-    client2.initialize(&admin, &fee_vault);
-    client2.set_router(&admin, &router);
-
-    let token_a_sac = StellarAssetClient::new(&env, &token_a);
-    token_a_sac.mint(&maker, &100_000_0000000);
-
-    let order_id = client2.place_order(
-        &maker, &token_a, &token_b,
-        &10_000_0000000, &9_999_5000000, &500,
-        &0, &0, &150,
-    );
-
-    env.ledger().set(LedgerInfo {
-        timestamp: 2000,
-        protocol_version: 20,
-        sequence_number: 200,
-        network_id: Default::default(),
-        base_reserve: 10,
-        min_temp_entry_ttl: 100_000,
-        min_persistent_entry_ttl: 100_000,
-        max_entry_ttl: 3_110_400,
-    });
-
-    // Taker (not the router) tries to claim — should panic
-    client2.claim_expired_timer(&taker, &order_id);
+    advance_to(&t.env, 400);
+    assert!(client.try_claim_expired_timer(&order_id).is_err());
 }
