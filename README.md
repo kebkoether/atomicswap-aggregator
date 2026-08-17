@@ -16,6 +16,8 @@ protocol was security-hardened in Aug 2026 and several interfaces changed.
 contracts/            Soroban contracts (Rust, soroban-sdk 27)
   swap-book/          On-chain orderbook: escrow, fills, oracle pricing, timers
   router/             Multi-venue route execution + permissionless keeper entry
+  twap-book/          TWAP orders: escrowed schedules, keeper-run slices with
+                      on-chain pace/price/cadence enforcement
   fee-vault/          Protocol fee custody (balance-based, no shadow accounting)
   adapters/aqua/      Aquarius adapter (real swap_chained ABI, pool registry)
   adapters/sushiswap/ ⚠️ placeholder ABI — do not deploy/register yet
@@ -44,6 +46,23 @@ scripts/              Testnet deployment
   `__constructor` at deploy time — no init front-running window.
 - **FeeVault balances are token balances.** Withdrawals check the actual
   token balance; there is no shadow accounting to drift or strand fees.
+
+## TWAP orders
+
+A maker escrows a total amount plus a schedule (`place_twap`); a
+permissionless keeper executes slices through the same venue adapters as
+the Router. The contract — never the keeper — enforces:
+
+- **Pace**: cumulative fill ≤ pro-rata schedule + a bounded catch-up band
+- **Price**: each slice's net proceeds must clear the maker's limit price,
+  or a fresh SwapBook oracle price ± slippage when no limit is set
+- **Cadence**: a minimum ledger gap between slices
+
+Proceeds stream to the maker every slice (net of the 0.5 bps fee). Cancel
+refunds the remainder instantly; anyone can `expire_twap` a lapsed order
+to trigger the refund. A malfunctioning keeper can only slow execution
+down — never fill at a worse price. v2 roadmap: volume-adaptive slice
+sizing (participation caps vs live venue volume) and P2P-book-first fills.
 
 ## Development
 

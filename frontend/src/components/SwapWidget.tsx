@@ -329,7 +329,11 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   const [tokenIn, setTokenIn] = useState('USDC');
   const [tokenOut, setTokenOut] = useState('PYUSD');
   const [amountIn, setAmountIn] = useState('');
-  const [mode, setMode] = useState<'instant' | 'p2p'>('instant');
+  const [mode, setMode] = useState<'instant' | 'p2p' | 'twap'>('instant');
+  // TWAP controls
+  const [twapDurationMin, setTwapDurationMin] = useState(360); // 6h default
+  const [twapLimitPrice, setTwapLimitPrice] = useState('');
+  const [twapMaxSlicePct, setTwapMaxSlicePct] = useState(10);
   const [loading, setLoading] = useState(false);
   const [quote, setQuote] = useState<any>(null);
   const [p2pPlan, setP2pPlan] = useState<any>(null);
@@ -408,7 +412,8 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
 
   // Trigger auto-quote when amount/tokens change in instant mode
   useEffect(() => {
-    if (mode === 'instant') {
+    if (mode === 'instant' || mode === 'twap') {
+      // TWAP reuses the instant quote as a full-size market estimate
       fetchQuoteDebounced(amountIn, tokenIn, tokenOut);
     }
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
@@ -444,6 +449,39 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
       setLoading(false);
     }
   }, [amountIn, tokenIn, tokenOut, walletAddress, priceMode, maxSlippageBps, autoRouteMinutes]);
+
+  // Place a TWAP order: build → sign (escrows total) → submit
+  const handleTwapSubmit = useCallback(async () => {
+    if (!walletAddress || !amountIn || parseFloat(amountIn) <= 0) return;
+    setSubmitting(true);
+    try {
+      const { buildTwap, submitTransaction } = await import('@/lib/api');
+      const baseAmount = Math.floor(parseFloat(amountIn) * 1e7).toString();
+      const { xdr, plan } = await buildTwap({
+        sourceAddress: walletAddress,
+        tokenIn: tokenParam(tokenIn),
+        tokenOut: tokenParam(tokenOut),
+        amountIn: baseAmount,
+        durationMinutes: twapDurationMin,
+        limitPrice: twapLimitPrice || undefined,
+        maxSlippageBps: twapLimitPrice ? undefined : maxSlippageBps,
+        maxSlicePct: twapMaxSlicePct,
+      });
+      const signed = await signTransaction(xdr);
+      await submitTransaction(signed);
+      alert(
+        `TWAP started: ${parseFloat(amountIn).toLocaleString()} ${tokenIn} over ` +
+        `${twapDurationMin >= 60 ? `${twapDurationMin / 60}h` : `${twapDurationMin}m`}. ` +
+        `Proceeds stream to your wallet as slices fill — track it on the Orders page.`
+      );
+      setAmountIn('');
+    } catch (error: any) {
+      console.error('TWAP submit error:', error);
+      alert(`Failed to start TWAP: ${error?.message || 'Unknown error'}`);
+    } finally {
+      setSubmitting(false);
+    }
+  }, [walletAddress, amountIn, tokenIn, tokenOut, twapDurationMin, twapLimitPrice, twapMaxSlicePct, maxSlippageBps, tokenParam, signTransaction]);
 
   // Submit the P2P order (sign + send the transaction)
   const handleP2pSubmit = useCallback(async () => {
@@ -520,6 +558,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         {([
           { key: 'instant' as const, label: 'Instant Swap', desc: 'Fills now via DEXs · venue fees only' },
           { key: 'p2p' as const, label: 'P2P Match', desc: 'Wait for a peer · 0.5 bps only' },
+          { key: 'twap' as const, label: 'TWAP', desc: 'Spread over time · keeper-run' },
         ]).map((tab) => (
           <button
             key={tab.key}
@@ -602,8 +641,8 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           label={mode === 'instant' ? 'Buying' : 'Buying (estimated)'}
           sublabel={loading ? 'Fetching...' : 'Balance: --'}
           value={
-            mode === 'instant' && quote
-              ? formatOutput(quote.netAmountOut)
+            (mode === 'instant' || mode === 'twap') && quote
+              ? `${mode === 'twap' ? '~' : ''}${formatOutput(quote.netAmountOut)}`
               : mode === 'p2p' && amountIn && parseFloat(amountIn) > 0
               ? p2pPlan
                 ? formatOutput(p2pPlan.summary?.instantFillAmount || '0')
@@ -617,6 +656,91 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           excludeToken={tokenIn}
           accent="#22c55e"
         />
+
+        {/* TWAP Options: duration, limit, participation */}
+        {mode === 'twap' && (
+          <div style={{ marginTop: '14px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            <div style={{ background: '#161b26', borderRadius: '12px', padding: '14px', border: '1px solid #252a3a' }}>
+              <div style={{ fontSize: '12px', fontWeight: 700, color: '#8a8f9c', marginBottom: '10px', textTransform: 'uppercase', letterSpacing: '0.8px' }}>
+                Execution window
+              </div>
+              <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                {([
+                  { min: 30, label: '30m' },
+                  { min: 60, label: '1h' },
+                  { min: 360, label: '6h' },
+                  { min: 1440, label: '24h' },
+                  { min: 4320, label: '3d' },
+                ]).map((opt) => (
+                  <button
+                    key={opt.min}
+                    onClick={() => setTwapDurationMin(opt.min)}
+                    style={{
+                      flex: 1,
+                      minWidth: '52px',
+                      padding: '10px 8px',
+                      borderRadius: '10px',
+                      border: twapDurationMin === opt.min ? '1px solid #6366f1' : '1px solid #1a1f2e',
+                      background: twapDurationMin === opt.min ? 'rgba(99, 102, 241, 0.08)' : 'transparent',
+                      cursor: 'pointer',
+                      color: twapDurationMin === opt.min ? '#e1e4ea' : '#565b68',
+                      fontSize: '13px',
+                      fontWeight: 600,
+                    }}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+
+              <div style={{ marginTop: '12px', display: 'flex', gap: '10px' }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: '12px', color: '#8a8f9c', marginBottom: '6px' }}>
+                    Limit price <span style={{ color: '#3a3f4c' }}>(min {tokenOut}/{tokenIn} · blank = market ± oracle)</span>
+                  </div>
+                  <input
+                    type="number"
+                    value={twapLimitPrice}
+                    onChange={(e) => setTwapLimitPrice(e.target.value)}
+                    placeholder="e.g. 0.9995"
+                    style={{
+                      width: '100%', background: '#0d1117', border: '1px solid #1a1f2e',
+                      borderRadius: '8px', padding: '8px 10px', color: '#e1e4ea',
+                      fontSize: '13px', outline: 'none',
+                    }}
+                  />
+                </div>
+                <div>
+                  <div style={{ fontSize: '12px', color: '#8a8f9c', marginBottom: '6px' }}>Max slice</div>
+                  <div style={{ display: 'flex', gap: '4px' }}>
+                    {[5, 10, 25].map((pct) => (
+                      <button
+                        key={pct}
+                        onClick={() => setTwapMaxSlicePct(pct)}
+                        style={{
+                          padding: '8px 10px', borderRadius: '8px',
+                          border: twapMaxSlicePct === pct ? '1px solid #6366f1' : '1px solid #1a1f2e',
+                          background: twapMaxSlicePct === pct ? 'rgba(99, 102, 241, 0.1)' : 'transparent',
+                          color: twapMaxSlicePct === pct ? '#e1e4ea' : '#565b68',
+                          fontSize: '12px', fontWeight: 600, cursor: 'pointer',
+                        }}
+                      >
+                        {pct}%
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ marginTop: '10px', fontSize: '11px', color: '#565b68', lineHeight: 1.5 }}>
+                Your total escrows on-chain and executes in slices over the window.
+                Pace, price floor, and slice cadence are enforced by the contract —
+                the keeper can only run it slower, never at a worse price. Proceeds
+                stream to your wallet; cancel anytime for an instant refund of the rest.
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* P2P Options: Price Mode + Timer */}
         {mode === 'p2p' && (
@@ -868,6 +992,15 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
             label = 'Signing transaction...';
           } else if (loading) {
             label = mode === 'p2p' ? 'Checking for matches...' : 'Finding best route...';
+          } else if (mode === 'twap') {
+            if (!hasAmount) {
+              label = 'Enter an amount';
+            } else {
+              onClick = handleTwapSubmit;
+              showGreen = true;
+              const dur = twapDurationMin >= 60 ? `${twapDurationMin / 60}h` : `${twapDurationMin}m`;
+              label = `Start TWAP · escrow ${parseFloat(amountIn).toLocaleString()} ${tokenIn} over ${dur}`;
+            }
           } else if (mode === 'instant') {
             if (quote && hasAmount) {
               onClick = handleInstantSwap;

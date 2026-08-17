@@ -1675,6 +1675,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "twap-book"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+ "swap-book",
+]
+
+[[package]]
 name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
