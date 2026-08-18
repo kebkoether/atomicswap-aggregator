@@ -151,17 +151,36 @@ impl AquaAdapter {
             .ok_or(AquaAdapterError::NotInitialized)?;
         let pool = Self::get_pool(&env, &token_in, &token_out)?;
 
-        // Allow the Aqua router to pull our token_in
-        let token_in_client = token::Client::new(&env, &token_in);
-        token_in_client.approve(
-            &env.current_contract_address(),
-            &aqua_router,
-            &amount_in,
-            &(env.ledger().sequence() + 100),
-        );
-
         let token_out_client = token::Client::new(&env, &token_out);
         let balance_before = token_out_client.balance(&env.current_contract_address());
+
+        // Aqua's router pulls funds via a nested `transfer(adapter → router)`
+        // on the token contract — NOT via allowance — so we pre-authorize
+        // exactly that sub-invocation. (Verified on mainnet 2026-08-17: the
+        // SAC rejects the pull with Error(Auth, InvalidAction) otherwise.)
+        //
+        // ORDER MATTERS: authorize_as_current_contract applies to the NEXT
+        // contract invocation this contract makes — it must sit immediately
+        // before the swap_chained call. (A balance() read between them
+        // silently consumed the authorization — also found on mainnet.)
+        env.authorize_as_current_contract(soroban_sdk::vec![
+            &env,
+            soroban_sdk::auth::InvokerContractAuthEntry::Contract(
+                soroban_sdk::auth::SubContractInvocation {
+                    context: soroban_sdk::auth::ContractContext {
+                        contract: token_in.clone(),
+                        fn_name: Symbol::new(&env, "transfer"),
+                        args: soroban_sdk::vec![
+                            &env,
+                            env.current_contract_address().into_val(&env),
+                            aqua_router.clone().into_val(&env),
+                            amount_in.into_val(&env),
+                        ],
+                    },
+                    sub_invocations: soroban_sdk::vec![&env],
+                }
+            ),
+        ]);
 
         // swaps_chain: single hop through the registered pool
         let chain_element = (pool.tokens.clone(), pool.pool_hash.clone(), token_out.clone());
