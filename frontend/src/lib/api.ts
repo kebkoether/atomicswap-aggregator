@@ -145,6 +145,25 @@ export async function buildCancelOrder(
   return response.json();
 }
 
+export async function buildSwap(body: {
+  sourceAddress: string;
+  tokenIn: string;
+  tokenOut: string;
+  amountIn: string;
+  slippage?: number;
+}): Promise<{ xdr: string; kind: 'soroban' | 'classic'; route: any }> {
+  const response = await fetch(`${API_BASE}/api/swap/build`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error || `Swap build failed: ${response.statusText}`);
+  }
+  return response.json();
+}
+
 // ─── TWAP ────────────────────────────────────────────────
 
 export async function buildTwap(body: {

@@ -9,11 +9,20 @@
 | Router | `CD4EKANBDBF5NNV6BNJVPIHGZLLUKEXBB3QXZ3QWPOX5LNCEFPOJ2J6I` |
 | TwapBook | `CAMZXFZCGAQNVEMNV56W4ZTCY3ELUGQROXVXFWGCECUNQ3ZA3AQT3Q2Z` |
 | Aqua adapter (v3) | `CC3P5UNO6PBVAKKQ7A6SJZ6G566X3VF2XNH5BFI7A3VFUGIMNPOP2HDY` |
+| Sushi adapter (v3) | `CDK4YWZSUEPCNDBA3VUVKXFLEKD2HWJ7JFXV5MEBGXWO6HNUO3YJ5D3R` |
 
 Admin/deployer: `GB3BIN23PHTOPHTEGTC4VCY2HVSY6HDYG3C6QXQQ3TCEJR74K6DWGMQT`
 Aqua pool registered on the adapter: XLM/USDC constant-product
 `CA6PUJLBYKZKUEKLZJMKBZLEKP2OTHANDEOWSFF44FTSYLKQPIICCJBE`
-(hash `b2e02fcf…aab7f0`). Venue 1 = Aqua on both Router and TwapBook.
+(hash `b2e02fcf…aab7f0`). Venue 1 = Aqua, venue 2 = Sushi on both Router
+and TwapBook. Sushi pair registered: XLM/USDC fee-3000 canonical pool
+`CCR2CH4GQVCZHG7CHFVMNANCK45CU5DVKXZIIITDZQAU3CEJZ7RQH2MQ` (2.4M XLM deep).
+SushiSwap venue contracts (reverse-engineered, see memory/PR notes):
+router `CDMIM23W…ZCHL`, quoter `CASKWJSI…2RWC`, factory `CCRSMJDI…GZGF`,
+position manager `CARTUL5A…UQZ4`. The adapter calls pools DIRECTLY
+(pool.swap + invoker auth + pre-authorized deterministic transfer) —
+Sushi's own router path is unusable from contracts (auth context contains
+dynamic oracle-hint state) and swap_prefunded is gated to their routers.
 
 Verified with dust-sized real transactions: instant swap via Aqua
 (fee exact at 0.5 bps ceil), P2P place/quote/fill, TWAP place +

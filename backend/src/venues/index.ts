@@ -62,7 +62,9 @@ export function createVenueRegistry(config: {
   }
 
   if (config.sushiAdapterContractId) {
-    registry.register(new SushiSwapAdapter(config.sushiAdapterContractId, stellar));
+    registry.register(
+      new SushiSwapAdapter(config.sushiAdapterContractId, stellar, process.env.SUSHI_PAIRS)
+    );
   }
 
   // Stellar DEX — always available, uses Horizon (no contract needed)

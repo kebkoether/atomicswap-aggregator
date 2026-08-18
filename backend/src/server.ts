@@ -15,6 +15,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
+import { Asset } from '@stellar/stellar-sdk';
 import { RoutingEngine } from './router/engine.js';
 import { createVenueRegistry } from './venues/index.js';
 import { StellarClient, scEnum } from './stellar/client.js';
@@ -284,6 +285,74 @@ function muldivCeil(a: bigint, b: bigint, d: bigint): bigint {
   return (a * b + d - 1n) / d;
 }
 
+// ─── Classic SDEX swap building ─────────────────────────
+
+const XLM_SAC = 'CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA';
+
+function classicAssetFor(sacOrSymbol: string): InstanceType<typeof Asset> {
+  if (sacOrSymbol === XLM_SAC || sacOrSymbol.toUpperCase() === 'XLM') {
+    return Asset.native();
+  }
+  const cfg = resolveToken(sacOrSymbol);
+  if (!cfg?.issuer) {
+    throw new BadRequest(`No classic asset known for ${sacOrSymbol}`);
+  }
+  return new Asset(cfg.symbol, cfg.issuer);
+}
+
+function toDisplay7(base: bigint): string {
+  const whole = base / 10000000n;
+  const frac = (base % 10000000n).toString().padStart(7, '0');
+  return `${whole}.${frac}`;
+}
+
+/** Build an unsigned classic path-payment-strict-send for the SDEX route. */
+async function buildClassicSwap(
+  sourceAddress: string,
+  tokenIn: string,
+  tokenOut: string,
+  amountIn: bigint,
+  expectedOut: bigint,
+  slippageBps: number
+): Promise<string> {
+  const sendAsset = classicAssetFor(tokenIn);
+  const destAsset = classicAssetFor(tokenOut);
+
+  // Fetch the winning path's hops from Horizon
+  const params = new URLSearchParams({
+    source_amount: toDisplay7(amountIn),
+    destination_assets: destAsset.isNative()
+      ? 'native'
+      : `${destAsset.getCode()}:${destAsset.getIssuer()}`,
+  });
+  if (sendAsset.isNative()) {
+    params.set('source_asset_type', 'native');
+  } else {
+    params.set('source_asset_type', sendAsset.getCode().length <= 4 ? 'credit_alphanum4' : 'credit_alphanum12');
+    params.set('source_asset_code', sendAsset.getCode());
+    params.set('source_asset_issuer', sendAsset.getIssuer());
+  }
+  const res = await fetch(`${config.horizonUrl}/paths/strict-send?${params}`);
+  if (!res.ok) throw new Error(`Horizon path lookup failed: ${res.status}`);
+  const data = (await res.json()) as any;
+  const best = (data?._embedded?.records || [])[0];
+  if (!best) throw new BadRequest('No classic path available for this pair');
+
+  const path: InstanceType<typeof Asset>[] = (best.path || []).map((p: any) =>
+    p.asset_type === 'native' ? Asset.native() : new Asset(p.asset_code, p.asset_issuer)
+  );
+  const destMin = (expectedOut * BigInt(10000 - slippageBps)) / 10000n;
+
+  return stellar.buildClassicPathPayment({
+    sourceAddress,
+    sendAsset,
+    sendAmount: toDisplay7(amountIn),
+    destAsset,
+    destMin: toDisplay7(destMin > 0n ? destMin : 1n),
+    path,
+  });
+}
+
 // ─── API Routes ─────────────────────────────────────────
 
 /**
@@ -463,11 +532,45 @@ app.post('/api/swap/build', async (req, res) => {
     const slippage = parseSlippageBps(req.body.slippage);
 
     // Route across venues the Router contract can actually execute
-    const route = await routingEngine.computeRoute(tokenIn, tokenOut, amountIn, slippage, {
-      executableOnly: true,
-    });
+    let route: Awaited<ReturnType<typeof routingEngine.computeRoute>> | null = null;
+    try {
+      route = await routingEngine.computeRoute(tokenIn, tokenOut, amountIn, slippage, {
+        executableOnly: true,
+      });
+    } catch {
+      route = null;
+    }
+    const routeNet = route && route.instructions.length > 0 ? route.netAmountOut : 0n;
 
-    if (route.instructions.length === 0) {
+    // Compare against the classic SDEX/classic-AMM route. Classic ops can't
+    // be Router segments (Soroban contracts cannot submit classic
+    // operations) — when SDEX wins, the user signs a classic
+    // path-payment-strict-send directly (the Soroswap pattern).
+    const sdexAdapter = registry.get(3);
+    let sdexOut = 0n;
+    if (sdexAdapter && (await sdexAdapter.isAvailable())) {
+      try {
+        sdexOut = (await sdexAdapter.getQuote(tokenIn, tokenOut, amountIn)).amountOut;
+      } catch {}
+    }
+
+    if (sdexOut > routeNet) {
+      const xdr = await buildClassicSwap(sourceAddress, tokenIn, tokenOut, amountIn, sdexOut, slippage);
+      res.json({
+        xdr,
+        kind: 'classic',
+        route: {
+          totalAmountIn: amountIn.toString(),
+          netAmountOut: sdexOut.toString(),
+          minTotalOut: ((sdexOut * BigInt(10000 - slippage)) / 10000n).toString(),
+          blendedBps: Number(((amountIn - sdexOut) * 10000n) / amountIn),
+          segments: [{ venue: 'StellarDEX (classic)', venueId: 3, amountIn: amountIn.toString(), expectedOut: sdexOut.toString() }],
+        },
+      });
+      return;
+    }
+
+    if (!route || route.instructions.length === 0) {
       throw new BadRequest('No executable venue liquidity for this pair');
     }
 
@@ -500,6 +603,7 @@ app.post('/api/swap/build', async (req, res) => {
 
     res.json({
       xdr,
+      kind: 'soroban',
       route: {
         totalAmountIn: route.totalAmountIn.toString(),
         netAmountOut: route.netAmountOut.toString(),
