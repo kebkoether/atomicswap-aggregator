@@ -527,15 +527,33 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     if (!walletAddress || !quote) return;
     setSubmitting(true);
     try {
-      // TODO: build and sign instant swap transaction via Router contract
-      alert('Instant swap signing not yet wired up — coming soon!');
+      const { buildSwap, submitTransaction } = await import('@/lib/api');
+      const baseAmount = Math.floor(parseFloat(amountIn) * 1e7).toString();
+      // The backend picks the best execution: Soroban route (Aqua/Sushi via
+      // the Router contract) or a classic SDEX path payment — either way
+      // it's one XDR to sign.
+      const { xdr, kind, route } = await buildSwap({
+        sourceAddress: walletAddress,
+        tokenIn: tokenParam(tokenIn),
+        tokenOut: tokenParam(tokenOut),
+        amountIn: baseAmount,
+        slippage: 50,
+      });
+      const signed = await signTransaction(xdr);
+      await submitTransaction(signed);
+      const via = kind === 'classic'
+        ? 'Stellar DEX (classic)'
+        : (route?.segments || []).map((s: any) => s.venue).join(' + ') || 'DEX route';
+      alert(`Swap submitted via ${via}. Check your wallet balance.`);
+      setAmountIn('');
+      setQuote(null);
     } catch (error: any) {
       console.error('Swap error:', error);
       alert(`Failed: ${error?.message || 'Unknown error'}`);
     } finally {
       setSubmitting(false);
     }
-  }, [walletAddress, quote]);
+  }, [walletAddress, quote, amountIn, tokenIn, tokenOut, tokenParam, signTransaction]);
 
   const formatOutput = (raw: string) => {
     if (!raw) return '0.00';

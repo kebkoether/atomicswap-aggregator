@@ -13,6 +13,8 @@ import {
   Keypair,
   Account,
   Address,
+  Asset,
+  Operation,
   nativeToScVal,
   scValToNative,
   xdr,
@@ -141,6 +143,40 @@ export class StellarClient {
 
     const preparedTx = rpc.assembleTransaction(tx, simResult);
     return preparedTx.build().toXDR();
+  }
+
+  /**
+   * Build an unsigned CLASSIC path-payment-strict-send transaction.
+   * Used when the SDEX/classic-AMM route beats the Soroban venues —
+   * classic operations cannot be executed from inside a Soroban contract,
+   * so the user signs this transaction directly (the Soroswap pattern).
+   */
+  async buildClassicPathPayment(opts: {
+    sourceAddress: string;
+    sendAsset: InstanceType<typeof Asset>;
+    sendAmount: string; // display units, 7dp string
+    destAsset: InstanceType<typeof Asset>;
+    destMin: string;    // display units, 7dp string
+    path: InstanceType<typeof Asset>[];
+  }): Promise<string> {
+    const account = await this.server.getAccount(opts.sourceAddress);
+    const tx = new TransactionBuilder(account, {
+      fee: '10000',
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(
+        Operation.pathPaymentStrictSend({
+          sendAsset: opts.sendAsset,
+          sendAmount: opts.sendAmount,
+          destination: opts.sourceAddress, // self-swap
+          destAsset: opts.destAsset,
+          destMin: opts.destMin,
+          path: opts.path,
+        })
+      )
+      .setTimeout(300)
+      .build();
+    return tx.toXDR();
   }
 
   /**

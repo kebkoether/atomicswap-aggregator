@@ -1,29 +1,64 @@
 #![no_std]
 
+//! SushiSwap V3 (Stellar) adapter — REAL ABI.
+//!
+//! Contract addresses + interface reverse-engineered from sushi.com's own
+//! frontend and verified via on-chain interface fetch (2026-08-18):
+//!   Router  CDMIM23WOUL5CZBKX3GOA3V5R5AMVIMTCP52KCDQORWELAPLJ27WZCHL
+//!   Quoter  CASKWJSINHFW7BF7RUOA4E2FP6B2TYRKFX2UOPWLCPOOPUR6UU3G2RWC
+//!   Factory CCRSMJDITH3VK5QOGYCVZDAKIY5GL3RCG4TCVLIAVB662IW2V5KJGZGF
+//!
+//! Router entry: swap_exact_input_single(params: ExactInputSingleParams)
+//! Quoter entry: quote_exact_input_single(token_in, token_out, fee: u32,
+//!               amount_in: i128, sqrt_price_limit_x96: U256) -> i128
+//!
+//! V3 pools are (token_a, token_b, fee_tier) triples — the fee tier is an
+//! admin-registered pair attribute here (like the Aqua pool registry).
+//!
+//! Funds flow: the AtomicSwap Router/TwapBook PUSHES token_in here first;
+//! this adapter pre-authorizes the venue's nested pull and pushes the
+//! output back to the caller.
+
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror,
-    symbol_short, token, Address, Env, IntoVal, Symbol,
+    symbol_short, token, Address, Env, IntoVal, Symbol, U256,
 };
-
-/// SushiSwap V3 adapter for Stellar/Soroban.
-///
-/// SushiSwap V3 launched on Stellar in February 2026 (concentrated
-/// liquidity). ⚠️ The function names used here (`quote_exact_in`,
-/// `swap_exact_in`) are PLACEHOLDERS — SushiSwap's actual Soroban router
-/// ABI and contract addresses must be verified before this adapter is
-/// registered as a live venue. Do not register it until then.
-///
-/// Funds flow (AtomicSwap Router contract → this adapter):
-///   The router PUSHES token_in to this adapter before invoking `swap`.
 
 // ─── Storage ────────────────────────────────────────────
 
 #[contracttype]
 pub enum DataKey {
     Admin,
-    /// The SushiSwap V3 router contract address
     SushiRouter,
+    SushiQuoter,
+    /// Registered (fee tier, pool address) for a directed pair
+    Pair(Address, Address),
 }
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PairInfo {
+    pub fee: u32,
+    pub pool: Address,
+}
+
+/// Mirror of the pool's OracleHints — field names must match exactly
+/// (contracttype structs encode as maps keyed by field name).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct OracleHints {
+    pub checkpoint: u32,
+    pub checkpoint_min: u32,
+    pub slot: u128,
+}
+
+/// Uniswap-V3 sqrt price bounds (Sushi's Stellar port keeps the constants).
+/// zero_for_one swaps push price DOWN toward MIN; the opposite toward MAX.
+const MIN_SQRT_RATIO_PLUS_1: u128 = 4295128740;
+// MAX_SQRT_RATIO - 1 = 0xFFFD8963EFD1FC6A506488495D951D5263988D25 (160 bits)
+const MAX_SQRT_LIMB1: u64 = 0x00000000FFFD8963;
+const MAX_SQRT_LIMB2: u64 = 0xEFD1FC6A50648849;
+const MAX_SQRT_LIMB3: u64 = 0x5D951D5263988D25;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -34,6 +69,7 @@ pub enum SushiAdapterError {
     Unauthorized = 3,
     SwapFailed = 4,
     InvalidAmount = 5,
+    PairNotSet = 6,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -44,14 +80,34 @@ pub struct SushiSwapAdapter;
 #[contractimpl]
 impl SushiSwapAdapter {
     /// Deploy-time constructor.
-    pub fn __constructor(env: Env, admin: Address, sushi_router: Address) {
+    pub fn __constructor(env: Env, admin: Address, sushi_router: Address, sushi_quoter: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::SushiRouter, &sushi_router);
+        env.storage().instance().set(&DataKey::SushiRouter, &sushi_router);
+        env.storage().instance().set(&DataKey::SushiQuoter, &sushi_quoter);
     }
 
-    /// Get a quote from SushiSwap V3 for a given swap.
+    /// Register the pool (fee tier + pool contract) for a pair, both
+    /// directions. Admin only. Pool address is needed to pre-authorize the
+    /// venue's nested fund pull wherever it lands (router or pool).
+    pub fn set_pair(
+        env: Env,
+        token_a: Address,
+        token_b: Address,
+        fee: u32,
+        pool: Address,
+    ) -> Result<(), SushiAdapterError> {
+        Self::require_admin(&env)?;
+        let info = PairInfo { fee, pool };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pair(token_a.clone(), token_b.clone()), &info);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pair(token_b, token_a), &info);
+        Ok(())
+    }
+
+    /// Quote via the Sushi quoter/lens contract.
     pub fn quote(
         env: Env,
         token_in: Address,
@@ -61,32 +117,31 @@ impl SushiSwapAdapter {
         if amount_in <= 0 {
             return Err(SushiAdapterError::InvalidAmount);
         }
-
-        let sushi_router: Address = env
+        let quoter: Address = env
             .storage()
             .instance()
-            .get(&DataKey::SushiRouter)
+            .get(&DataKey::SushiQuoter)
             .ok_or(SushiAdapterError::NotInitialized)?;
+        let pair = Self::get_pair(&env, &token_in, &token_out)?;
 
-        // ⚠️ Placeholder function name — verify against SushiSwap's ABI.
-        let estimated_out: i128 = env.invoke_contract(
-            &sushi_router,
-            &Symbol::new(&env, "quote_exact_in"),
+        let out: i128 = env.invoke_contract(
+            &quoter,
+            &Symbol::new(&env, "quote_exact_input_single"),
             soroban_sdk::vec![
                 &env,
                 token_in.into_val(&env),
                 token_out.into_val(&env),
+                pair.fee.into_val(&env),
                 amount_in.into_val(&env),
+                U256::from_u32(&env, 0).into_val(&env),
             ],
         );
-
-        Ok(estimated_out)
+        Ok(out)
     }
 
     /// Execute a swap through SushiSwap V3.
     ///
-    /// Expects `amount_in` of token_in to have been pushed to this contract
-    /// by the caller beforehand. Sends output to `recipient`.
+    /// Expects `amount_in` of token_in pushed to this contract beforehand.
     pub fn swap(
         env: Env,
         recipient: Address,
@@ -98,42 +153,82 @@ impl SushiSwapAdapter {
         if amount_in <= 0 || min_amount_out < 0 {
             return Err(SushiAdapterError::InvalidAmount);
         }
+        let pair = Self::get_pair(&env, &token_in, &token_out)?;
+        let pool = pair.pool.clone();
 
-        let sushi_router: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::SushiRouter)
-            .ok_or(SushiAdapterError::NotInitialized)?;
-
-        // Allow the Sushi router to pull our token_in
-        let token_in_client = token::Client::new(&env, &token_in);
-        token_in_client.approve(
-            &env.current_contract_address(),
-            &sushi_router,
-            &amount_in,
-            &(env.ledger().sequence() + 100),
+        // We call the POOL directly via its prefunded entry point rather
+        // than Sushi's router: the router path requires an auth entry
+        // containing dynamic oracle-hint state that no contract can
+        // pre-authorize (verified on mainnet 2026-08-18). As the pool's
+        // DIRECT invoker, our own require_auth passes via invoker auth,
+        // and prefunding removes the nested pull entirely.
+        let token0: Address = env.invoke_contract(
+            &pool,
+            &Symbol::new(&env, "token0"),
+            soroban_sdk::vec![&env],
         );
+        let zero_for_one = token_in == token0;
+        let hints: OracleHints = env.invoke_contract(
+            &pool,
+            &Symbol::new(&env, "get_oracle_hints"),
+            soroban_sdk::vec![&env],
+        );
+        let sqrt_limit = if zero_for_one {
+            U256::from_u128(&env, MIN_SQRT_RATIO_PLUS_1)
+        } else {
+            U256::from_parts(&env, 0, MAX_SQRT_LIMB1, MAX_SQRT_LIMB2, MAX_SQRT_LIMB3)
+        };
 
         let token_out_client = token::Client::new(&env, &token_out);
         let balance_before = token_out_client.balance(&env.current_contract_address());
 
-        // ⚠️ Placeholder function name — verify against SushiSwap's ABI.
-        let _: () = env.invoke_contract(
-            &sushi_router,
-            &Symbol::new(&env, "swap_exact_in"),
+        // Direct pool.swap: the pool's require_auth(sender=this contract)
+        // passes via invoker auth since we are the DIRECT caller, and the
+        // pool's nested pull is a deterministic transfer(this → pool,
+        // amount) we can pre-authorize. (swap_prefunded is gated to
+        // factory-authorized routers; the Sushi-router path needs an auth
+        // context with dynamic oracle-hint state no contract can predict —
+        // both verified on mainnet 2026-08-18.)
+        // NOTE: the authorization is consumed by the NEXT cross-contract
+        // call — it must sit immediately before the swap invocation.
+        env.authorize_as_current_contract(soroban_sdk::vec![
+            &env,
+            soroban_sdk::auth::InvokerContractAuthEntry::Contract(
+                soroban_sdk::auth::SubContractInvocation {
+                    context: soroban_sdk::auth::ContractContext {
+                        contract: token_in.clone(),
+                        fn_name: Symbol::new(&env, "transfer"),
+                        args: soroban_sdk::vec![
+                            &env,
+                            env.current_contract_address().into_val(&env),
+                            pool.clone().into_val(&env),
+                            amount_in.into_val(&env),
+                        ],
+                    },
+                    sub_invocations: soroban_sdk::vec![&env],
+                }
+            ),
+        ]);
+
+        // swap(sender, recipient, zero_for_one, amount_specified,
+        //      sqrt_price_limit_x96, hints) -> SwapResult
+        let _result: soroban_sdk::Val = env.invoke_contract(
+            &pool,
+            &Symbol::new(&env, "swap"),
             soroban_sdk::vec![
                 &env,
                 env.current_contract_address().into_val(&env),
-                token_in.clone().into_val(&env),
-                token_out.clone().into_val(&env),
+                env.current_contract_address().into_val(&env),
+                zero_for_one.into_val(&env),
                 amount_in.into_val(&env),
-                min_amount_out.into_val(&env),
+                sqrt_limit.into_val(&env),
+                hints.into_val(&env),
             ],
         );
 
+        // Measure by balance delta — robust to venue-side rounding
         let balance_after = token_out_client.balance(&env.current_contract_address());
         let actual_out = balance_after - balance_before;
-
         if actual_out < min_amount_out {
             return Err(SushiAdapterError::SwapFailed);
         }
@@ -147,12 +242,15 @@ impl SushiSwapAdapter {
         Ok(actual_out)
     }
 
-    /// Update the SushiSwap router address. Admin only.
-    pub fn set_sushi_router(env: Env, new_router: Address) -> Result<(), SushiAdapterError> {
+    /// Update venue contract addresses. Admin only.
+    pub fn set_contracts(
+        env: Env,
+        sushi_router: Address,
+        sushi_quoter: Address,
+    ) -> Result<(), SushiAdapterError> {
         Self::require_admin(&env)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::SushiRouter, &new_router);
+        env.storage().instance().set(&DataKey::SushiRouter, &sushi_router);
+        env.storage().instance().set(&DataKey::SushiQuoter, &sushi_quoter);
         Ok(())
     }
 
@@ -166,5 +264,16 @@ impl SushiSwapAdapter {
             .ok_or(SushiAdapterError::NotInitialized)?;
         admin.require_auth();
         Ok(())
+    }
+
+    fn get_pair(
+        env: &Env,
+        token_in: &Address,
+        token_out: &Address,
+    ) -> Result<PairInfo, SushiAdapterError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Pair(token_in.clone(), token_out.clone()))
+            .ok_or(SushiAdapterError::PairNotSet)
     }
 }

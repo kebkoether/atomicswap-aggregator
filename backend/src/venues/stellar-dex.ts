@@ -185,8 +185,14 @@ export class StellarDexAdapter implements VenueAdapter {
       return new Asset(byAddress.symbol, byAddress.issuer);
     }
 
-    // Handle XLM
-    if (upper === 'XLM' || upper === 'NATIVE') {
+    // Handle XLM — by symbol OR by its well-known SAC address (the routing
+    // pipeline passes SAC addresses; missing this returned 0-quotes for
+    // every XLM pair on SDEX)
+    if (
+      upper === 'XLM' ||
+      upper === 'NATIVE' ||
+      symbolOrAddress === 'CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA'
+    ) {
       return Asset.native();
     }
 
