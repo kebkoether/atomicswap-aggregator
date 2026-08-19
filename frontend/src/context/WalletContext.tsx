@@ -3,23 +3,45 @@
 import { createContext, useContext, useState, useCallback, useEffect, ReactNode } from 'react';
 
 /**
- * Freighter wallet context — written against @stellar/freighter-api v2+.
- * v2 breaking changes vs v1:
- *   - every call returns an object ({ address }, { isConnected }, ...)
- *   - getPublicKey() is gone → requestAccess() / getAddress()
- *   - signTransaction() returns { signedTxXdr, signerAddress }
+ * Wallet context backed by Stellar Wallets Kit v2 — one integration for
+ * Freighter, xBull, LOBSTR, Albedo, Hana, Rabet, Ledger, Trezor, Fordefi,
+ * HOT Wallet and more (kit's default module set).
+ *
+ * The kit is imported dynamically inside callbacks so nothing touches
+ * window/document during Next.js prerender.
  */
 
-/** The network this app is built against. Signing on any other network is refused. */
+/** The network this app is built against. Signing is pinned to it. */
 const EXPECTED_PASSPHRASE =
   process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE ?? 'Test SDF Network ; September 2015';
+
+const STORAGE_KEY = 'atomicswap.wallet'; // { walletId, address }
+
+let kitReady = false;
+
+async function getKit() {
+  const [{ StellarWalletsKit, Networks }, { defaultModules }] = await Promise.all([
+    import('@creit.tech/stellar-wallets-kit'),
+    import('@creit.tech/stellar-wallets-kit/modules/utils'),
+  ]);
+  if (!kitReady) {
+    StellarWalletsKit.init({
+      modules: defaultModules(),
+      network: EXPECTED_PASSPHRASE.startsWith('Public Global')
+        ? Networks.PUBLIC
+        : Networks.TESTNET,
+    });
+    kitReady = true;
+  }
+  return StellarWalletsKit;
+}
 
 interface WalletState {
   connected: boolean;
   address: string | null;
   network: string | null;
   networkPassphrase: string | null;
-  /** True when the wallet is on a different network than the app expects. */
+  /** True when the wallet reports a different network than the app expects. */
   networkMismatch: boolean;
   loading: boolean;
 }
@@ -45,85 +67,86 @@ const DISCONNECTED: WalletState = {
 export function WalletProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<WalletState>(DISCONNECTED);
 
-  const applyConnection = useCallback(
-    (address: string, network: string | null, networkPassphrase: string | null) => {
-      setState({
-        connected: true,
-        address,
-        network,
-        networkPassphrase,
-        networkMismatch:
-          networkPassphrase !== null && networkPassphrase !== EXPECTED_PASSPHRASE,
-        loading: false,
-      });
-    },
-    []
-  );
+  const applyConnection = useCallback((address: string, networkPassphrase: string | null) => {
+    setState({
+      connected: true,
+      address,
+      network: networkPassphrase
+        ? networkPassphrase.startsWith('Public Global') ? 'PUBLIC' : 'TESTNET'
+        : null,
+      networkPassphrase,
+      networkMismatch:
+        networkPassphrase !== null && networkPassphrase !== EXPECTED_PASSPHRASE,
+      loading: false,
+    });
+  }, []);
 
-  // On mount, restore a previously-granted session
+  // Restore a previous session (same wallet, silent where the wallet allows)
   useEffect(() => {
     (async () => {
       if (typeof window === 'undefined') return;
       try {
-        const freighter = await import('@stellar/freighter-api');
-
-        const connected = await freighter.isConnected();
-        if (!connected.isConnected) return;
-
-        const allowed = await freighter.isAllowed();
-        if (!allowed.isAllowed) return;
-
-        const addr = await freighter.getAddress();
-        if (!addr.address) return;
-
-        const details = await freighter.getNetworkDetails();
-        applyConnection(
-          addr.address,
-          details.network ?? null,
-          details.networkPassphrase ?? null
-        );
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return;
+        const { walletId, address } = JSON.parse(raw);
+        if (!walletId || !address) return;
+        const kit = await getKit();
+        kit.setWallet(walletId);
+        // Confirm the wallet still grants access — silent for authorized
+        // extensions; if it prompts or fails, stay disconnected.
+        const fetched = await kit.fetchAddress().catch(() => null);
+        if (fetched?.address) {
+          let passphrase: string | null = null;
+          try {
+            passphrase = (await kit.getNetwork()).networkPassphrase;
+          } catch {}
+          applyConnection(fetched.address, passphrase);
+        }
       } catch {
-        // Extension not installed or errored — that's fine
+        // No restore — user connects manually
       }
     })();
   }, [applyConnection]);
 
   const connect = useCallback(async () => {
     if (typeof window === 'undefined') return;
-
     setState((s) => ({ ...s, loading: true }));
     try {
-      const freighter = await import('@stellar/freighter-api');
-
-      const connected = await freighter.isConnected();
-      if (!connected.isConnected) {
-        // Extension not found — open download page
-        window.open('https://www.freighter.app/', '_blank');
+      const kit = await getKit();
+      const { address } = await kit.authModal();
+      if (!address) {
         setState((s) => ({ ...s, loading: false }));
         return;
       }
-
-      // Pops the Freighter approval dialog
-      const access = await freighter.requestAccess();
-      if (access.error || !access.address) {
-        console.error('Freighter access denied:', access.error);
-        setState((s) => ({ ...s, loading: false }));
-        return;
+      let passphrase: string | null = null;
+      try {
+        passphrase = (await kit.getNetwork()).networkPassphrase;
+      } catch {
+        // Some wallets don't expose their network — signing still pins
+        // the passphrase explicitly, so this is informational only.
       }
-
-      const details = await freighter.getNetworkDetails();
-      applyConnection(
-        access.address,
-        details.network ?? null,
-        details.networkPassphrase ?? null
-      );
-    } catch (error) {
-      console.error('Wallet connection failed:', error);
+      try {
+        const { StellarWalletsKit } = await import('@creit.tech/stellar-wallets-kit');
+        const walletId = StellarWalletsKit.selectedModule?.productId ?? null;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ walletId, address }));
+      } catch {}
+      applyConnection(address, passphrase);
+    } catch (error: any) {
+      // Modal dismissed or connection refused — stay disconnected quietly
+      if (!/closed|cancel/i.test(error?.message ?? '')) {
+        console.error('Wallet connection failed:', error);
+      }
       setState((s) => ({ ...s, loading: false }));
     }
   }, [applyConnection]);
 
   const disconnect = useCallback(() => {
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {}
+    getKit()
+      .then((kit) => kit.disconnect())
+      .catch(() => {});
     setState(DISCONNECTED);
   }, []);
 
@@ -132,26 +155,30 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       if (!state.connected || !state.address) {
         throw new Error('Wallet not connected');
       }
+      const kit = await getKit();
 
-      const freighter = await import('@stellar/freighter-api');
-
-      // Re-check the network at signing time — the user may have switched
-      const details = await freighter.getNetworkDetails();
-      if (details.networkPassphrase !== EXPECTED_PASSPHRASE) {
-        throw new Error(
-          `Wrong network: wallet is on "${details.network ?? 'unknown'}" but this app targets ` +
-          `"${EXPECTED_PASSPHRASE}". Switch networks in Freighter and try again.`
-        );
+      // Network guard: if the wallet reports its network and it isn't ours,
+      // refuse before prompting a signature.
+      try {
+        const { networkPassphrase } = await kit.getNetwork();
+        if (networkPassphrase && networkPassphrase !== EXPECTED_PASSPHRASE) {
+          throw new Error(
+            `Wrong network: your wallet is on a different network than this app ` +
+            `("${EXPECTED_PASSPHRASE}"). Switch networks in your wallet and try again.`
+          );
+        }
+      } catch (e: any) {
+        if (/Wrong network/.test(e?.message ?? '')) throw e;
+        // Wallet doesn't support network introspection — proceed; the
+        // explicit passphrase below still scopes the signature.
       }
 
-      const result = await freighter.signTransaction(xdr, {
+      const result = await kit.signTransaction(xdr, {
         networkPassphrase: EXPECTED_PASSPHRASE,
         address: state.address,
       });
-      if (result.error || !result.signedTxXdr) {
-        throw new Error(
-          `Signing failed: ${typeof result.error === 'string' ? result.error : 'rejected in Freighter'}`
-        );
+      if (!result?.signedTxXdr) {
+        throw new Error('Signing failed or was rejected in the wallet');
       }
       return result.signedTxXdr;
     },
