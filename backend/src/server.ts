@@ -820,6 +820,32 @@ app.post('/api/peer-swap/build', async (req, res) => {
 // ─── TWAP endpoints ─────────────────────────────────────
 
 /**
+ * GET /api/twap/fee
+ *
+ * Current TWAP protocol fee, read from the TwapBook contract (get_fee).
+ * The on-chain hard cap (10 bps) cannot be raised without deploying a new
+ * contract, so the cap is reported as a constant.
+ */
+let twapFeeCache: { feeBps: number; ts: number } | null = null;
+app.get('/api/twap/fee', async (_req, res) => {
+  try {
+    if (!config.twapBookContractId) throw new BadRequest('TWAP not deployed');
+    if (!twapFeeCache || Date.now() - twapFeeCache.ts > 10 * 60_000) {
+      const fee = await stellar.simulateAndParse<[bigint, bigint]>(
+        config.twapBookContractId,
+        'get_fee',
+        []
+      );
+      if (!fee) throw new Error('get_fee simulation returned no result');
+      twapFeeCache = { feeBps: Number(fee[0]) / (Number(fee[1]) / 10_000), ts: Date.now() };
+    }
+    res.json({ feeBps: twapFeeCache.feeBps, maxFeeBps: 10 });
+  } catch (error) {
+    handleError(res, error, 'Failed to read TWAP fee');
+  }
+});
+
+/**
  * POST /api/twap/build
  *
  * Build an unsigned place_twap transaction (escrows the total on signing).

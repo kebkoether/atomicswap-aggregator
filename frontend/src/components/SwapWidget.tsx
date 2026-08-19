@@ -375,6 +375,14 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   const [twapDurationMin, setTwapDurationMin] = useState(360); // 6h default
   const [twapLimitPrice, setTwapLimitPrice] = useState('');
   const [twapMaxSlicePct, setTwapMaxSlicePct] = useState(10);
+  const [twapFeeBps, setTwapFeeBps] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (mode !== 'twap' || twapFeeBps !== null) return;
+    import('@/lib/api').then(({ getTwapFee }) =>
+      getTwapFee().then((f) => { if (f) setTwapFeeBps(f.feeBps); })
+    );
+  }, [mode, twapFeeBps]);
   const [loading, setLoading] = useState(false);
   const [quote, setQuote] = useState<any>(null);
   const [p2pPlan, setP2pPlan] = useState<any>(null);
@@ -855,6 +863,16 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                 Pace, price floor, and slice cadence are enforced by the contract —
                 the keeper can only run it slower, never at a worse price. Proceeds
                 stream to your wallet; cancel anytime for an instant refund of the rest.
+                {twapFeeBps !== null && (
+                  <>
+                    {' '}Execution fee:{' '}
+                    <strong style={{ color: '#8a8f9c' }}>
+                      {(twapFeeBps / 100).toFixed(2)}% per slice
+                    </strong>{' '}
+                    (hard-capped on-chain at 0.10%). Your limit price applies to
+                    net proceeds after the fee.
+                  </>
+                )}
               </div>
             </div>
           </div>

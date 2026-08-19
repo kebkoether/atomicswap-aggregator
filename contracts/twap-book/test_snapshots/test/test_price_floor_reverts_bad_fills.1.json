@@ -139,7 +139,7 @@
                   "u32": 1100
                 },
                 {
-                  "i128": "9995"
+                  "i128": "9985"
                 },
                 {
                   "i128": "10000"
@@ -486,7 +486,7 @@
                       "symbol": "limit_num"
                     },
                     "val": {
-                      "i128": "9995"
+                      "i128": "9985"
                     }
                   },
                   {
@@ -657,6 +657,18 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "FeePer100k"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "100"
                       }
                     },
                     {

@@ -108,6 +108,16 @@ export async function getUserOrders(address: string): Promise<any[]> {
   return data.orders;
 }
 
+export async function getTwapFee(): Promise<{ feeBps: number; maxFeeBps: number } | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/twap/fee`);
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
 export async function getOraclePrice(
   tokenIn: string,
   tokenOut: string
