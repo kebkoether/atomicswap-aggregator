@@ -74,6 +74,18 @@ export async function getAssets(): Promise<Asset[]> {
   return data.assets;
 }
 
+/** Full assets payload: token list + server-side config (P2P corridor). */
+export async function getAssetsFull(): Promise<{
+  assets: Asset[];
+  p2pAllowed: string[];
+}> {
+  const response = await fetch(`${API_BASE}/api/assets`);
+  if (!response.ok) {
+    throw new Error(`Assets fetch failed: ${response.statusText}`);
+  }
+  return response.json();
+}
+
 export async function getOrders(
   tokenIn: string,
   tokenOut: string

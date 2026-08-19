@@ -1,9 +1,32 @@
 'use client';
 
+import { useEffect, useRef, useState } from 'react';
 import { useWallet } from '@/context/WalletContext';
+
+const IS_MAINNET = (process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE ?? '').startsWith('Public Global');
 
 export default function Header() {
   const { connected, address, loading, connect, disconnect } = useWallet();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  const copyAddress = async () => {
+    if (!address) return;
+    try {
+      await navigator.clipboard.writeText(address);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {}
+  };
 
   return (
     <header
@@ -59,14 +82,14 @@ export default function Header() {
             style={{
               fontSize: '11px',
               fontWeight: 500,
-              color: '#6366f1',
-              background: 'rgba(99, 102, 241, 0.1)',
+              color: IS_MAINNET ? '#22c55e' : '#f59e0b',
+              background: IS_MAINNET ? 'rgba(34, 197, 94, 0.1)' : 'rgba(245, 158, 11, 0.12)',
               padding: '2px 8px',
               borderRadius: '4px',
               letterSpacing: '0.5px',
             }}
           >
-            TESTNET
+            {IS_MAINNET ? 'MAINNET' : 'TESTNET'}
           </span>
         </div>
 
@@ -74,62 +97,93 @@ export default function Header() {
         <div style={{ display: 'flex', alignItems: 'center', gap: '32px' }}>
           <a
             href="/"
-            style={{
-              fontSize: '14px',
-              fontWeight: 500,
-              color: '#e1e4ea',
-              textDecoration: 'none',
-            }}
+            style={{ fontSize: '14px', fontWeight: 500, color: '#e1e4ea', textDecoration: 'none' }}
           >
             Swap
           </a>
           <a
             href="/orders"
-            style={{
-              fontSize: '14px',
-              fontWeight: 500,
-              color: '#8a8f9c',
-              textDecoration: 'none',
-            }}
+            style={{ fontSize: '14px', fontWeight: 500, color: '#8a8f9c', textDecoration: 'none' }}
           >
             Orders
           </a>
 
           {connected && address ? (
-            <button
-              onClick={disconnect}
-              style={{
-                background: '#1a1f2e',
-                color: '#e1e4ea',
-                border: '1px solid #252a3a',
-                borderRadius: '10px',
-                padding: '10px 16px',
-                fontSize: '14px',
-                fontWeight: 500,
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '8px',
-              }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.borderColor = '#ef4444';
-                e.currentTarget.style.color = '#ef4444';
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.borderColor = '#252a3a';
-                e.currentTarget.style.color = '#e1e4ea';
-              }}
-            >
-              <div
+            <div ref={menuRef} style={{ position: 'relative' }}>
+              <button
+                onClick={() => setMenuOpen((v) => !v)}
                 style={{
-                  width: '8px',
-                  height: '8px',
-                  borderRadius: '50%',
-                  background: '#22c55e',
+                  background: '#1a1f2e',
+                  color: '#e1e4ea',
+                  border: menuOpen ? '1px solid #6366f1' : '1px solid #252a3a',
+                  borderRadius: '10px',
+                  padding: '10px 16px',
+                  fontSize: '14px',
+                  fontWeight: 500,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
                 }}
-              />
-              {address.slice(0, 4)}...{address.slice(-4)}
-            </button>
+              >
+                <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#22c55e' }} />
+                {address.slice(0, 4)}...{address.slice(-4)}
+                <span style={{ fontSize: '10px', opacity: 0.6 }}>▾</span>
+              </button>
+
+              {menuOpen && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: 'calc(100% + 6px)',
+                    right: 0,
+                    background: '#131722',
+                    border: '1px solid #252a3a',
+                    borderRadius: '12px',
+                    padding: '6px',
+                    minWidth: '200px',
+                    boxShadow: '0 16px 48px rgba(0,0,0,0.5)',
+                  }}
+                >
+                  <div
+                    style={{
+                      padding: '8px 10px',
+                      fontSize: '11px',
+                      color: '#565b68',
+                      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                      wordBreak: 'break-all',
+                    }}
+                  >
+                    {address.slice(0, 10)}…{address.slice(-8)}
+                  </div>
+                  <button onClick={copyAddress} style={menuItemStyle}>
+                    {copied ? '✓ Copied' : 'Copy address'}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setMenuOpen(false);
+                      // Freighter reconnects silently while authorized — to
+                      // switch accounts, change the active account in the
+                      // Freighter extension, then reconnect.
+                      disconnect();
+                      setTimeout(() => connect(), 100);
+                    }}
+                    style={menuItemStyle}
+                  >
+                    Reconnect / switch account
+                  </button>
+                  <button
+                    onClick={() => {
+                      setMenuOpen(false);
+                      disconnect();
+                    }}
+                    style={{ ...menuItemStyle, color: '#ef4444' }}
+                  >
+                    Disconnect
+                  </button>
+                </div>
+              )}
+            </div>
           ) : (
             <button
               onClick={connect}
@@ -155,3 +209,16 @@ export default function Header() {
     </header>
   );
 }
+
+const menuItemStyle: React.CSSProperties = {
+  display: 'block',
+  width: '100%',
+  textAlign: 'left',
+  padding: '9px 10px',
+  background: 'transparent',
+  border: 'none',
+  borderRadius: '8px',
+  color: '#e1e4ea',
+  fontSize: '13px',
+  cursor: 'pointer',
+};

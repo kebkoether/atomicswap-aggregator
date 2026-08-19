@@ -364,8 +364,25 @@ async function buildClassicSwap(
  * the curated corridor.
  */
 app.get('/api/assets', (_req, res) => {
+  // TWAP eligibility: only tokens with a REGISTERED venue pool — the
+  // adapters' pair registries (env mirrors of on-chain set_pool/set_pair)
+  // are the source of truth. Self-maintaining: register a pool, the token
+  // becomes TWAP-able.
+  const eligibleSacs = new Set<string>();
+  for (const envName of ['SUSHI_PAIRS', 'AQUA_PAIRS']) {
+    try {
+      const pairs = JSON.parse(process.env[envName] ?? '[]');
+      for (const p of pairs) {
+        if (p.tokenA) eligibleSacs.add(p.tokenA);
+        if (p.tokenB) eligibleSacs.add(p.tokenB);
+      }
+    } catch {}
+  }
   res.json({
-    assets: tokenDiscovery.getTokens(),
+    assets: tokenDiscovery.getTokens().map((t) => ({
+      ...t,
+      twapEligible: eligibleSacs.has(t.sacAddress),
+    })),
     discovery: tokenDiscovery.getStatus(),
     p2pAllowed: P2P_ALLOWED_TOKENS,
   });

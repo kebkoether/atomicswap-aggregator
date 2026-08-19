@@ -16,6 +16,10 @@ interface Token {
   sacAddress?: string;
   /** Curated registry entries are verified; venue-discovered ones are not */
   verified?: boolean;
+  /** Aggregate venue volume — powers hot-first ordering */
+  venueVolume?: number;
+  /** Has a registered venue pool → allowed in the TWAP tab */
+  twapEligible?: boolean;
 }
 
 /**
@@ -54,12 +58,14 @@ function assetToToken(asset: any): Token {
     status: asset.status,
     sacAddress: asset.sacAddress || undefined,
     verified: asset.verified ?? asset.source === 'curated',
+    venueVolume: asset.venueVolume ?? 0,
+    twapEligible: asset.twapEligible ?? false,
   };
 }
 
-// P2P matching is scoped to the USDC/USDT0 corridor. (USDT0 unlocks
-// automatically once its registry entry flips to 'live'.)
-const P2P_ALLOWED = ['USDC', 'USDT0'];
+// Fallback P2P corridor — replaced at runtime by the backend's p2pAllowed
+// (P2P_ALLOWED_TOKENS env), so the corridor is a server-side product knob.
+const P2P_ALLOWED_FALLBACK = ['USDC', 'USDT0'];
 
 // ─── Token Icon ─────────────────────────────────────────
 
@@ -100,6 +106,7 @@ function TokenDropdown({
   exclude?: string;
 }) {
   const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -110,9 +117,19 @@ function TokenDropdown({
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
+  useEffect(() => {
+    if (!open) setQuery('');
+  }, [open]);
+
   const selectedToken = tokens.find((t) => t.symbol === selected) || tokens[0];
-  // Show all tokens but exclude the one selected on the other side
-  const available = tokens.filter((t) => t.symbol !== exclude);
+  // Exclude the token on the other side; filter by search query.
+  // List arrives volume-sorted (hot first) from the widget.
+  const q = query.trim().toLowerCase();
+  const available = tokens.filter(
+    (t) =>
+      t.symbol !== exclude &&
+      (!q || t.symbol.toLowerCase().includes(q) || t.name.toLowerCase().includes(q))
+  );
 
   return (
     <div ref={ref} style={{ position: 'relative', zIndex: open ? 50 : 1 }}>
@@ -156,11 +173,31 @@ function TokenDropdown({
             boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
           }}
         >
-          <div style={{ padding: '8px 12px 6px', fontSize: '11px', color: '#565b68', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-            Select token
-          </div>
-          {available.map((token) => {
+          <input
+            autoFocus
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search token…"
+            style={{
+              width: 'calc(100% - 8px)',
+              margin: '4px',
+              padding: '9px 12px',
+              background: '#0d1117',
+              border: '1px solid #252a3a',
+              borderRadius: '10px',
+              color: '#e1e4ea',
+              fontSize: '13px',
+              outline: 'none',
+            }}
+          />
+          {available.length === 0 && (
+            <div style={{ padding: '12px', fontSize: '13px', color: '#565b68', textAlign: 'center' }}>
+              No tokens match “{query}”
+            </div>
+          )}
+          {available.map((token, idx) => {
             const isComingSoon = token.status === 'coming_soon';
+            const isHot = !q && idx < 10 && (token.venueVolume ?? 0) > 0;
             return (
               <button
                 key={token.symbol}
@@ -185,7 +222,10 @@ function TokenDropdown({
               >
                 <TokenIcon symbol={token.symbol} color={token.color} size={32} />
                 <div style={{ textAlign: 'left', flex: 1 }}>
-                  <div style={{ fontWeight: 600, fontSize: '14px' }}>{token.symbol}</div>
+                  <div style={{ fontWeight: 600, fontSize: '14px' }}>
+                    {token.symbol}
+                    {isHot && <span style={{ marginLeft: '6px', fontSize: '11px' }} title="High venue volume">🔥</span>}
+                  </div>
                   <div style={{ fontSize: '12px', color: isComingSoon ? '#3a3f4c' : '#8a8f9c' }}>{token.name}</div>
                 </div>
                 {isComingSoon && (
@@ -330,6 +370,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   const [tokenOut, setTokenOut] = useState('PYUSD');
   const [amountIn, setAmountIn] = useState('');
   const [mode, setMode] = useState<'instant' | 'p2p' | 'twap'>('instant');
+  const [instantSlippageBps, setInstantSlippageBps] = useState(50);
   // TWAP controls
   const [twapDurationMin, setTwapDurationMin] = useState(360); // 6h default
   const [twapLimitPrice, setTwapLimitPrice] = useState('');
@@ -343,20 +384,26 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   const [oraclePrice, setOraclePrice] = useState<number | null>(null);
   const { connected: walletConnected, address: walletAddress, connect: connectWallet, signTransaction } = useWallet();
 
-  // Aggregated token universe from the backend (curated + venue-discovered).
-  // Falls back to the curated list if the API is unreachable.
+  // Aggregated token universe from the backend (curated + venue-discovered),
+  // hot-first: sorted by venue volume so the tokens people actually trade sit
+  // at the top of the dropdown. Falls back to the curated list offline.
   const [allTokens, setAllTokens] = useState<Token[]>(TOKENS);
+  const [p2pAllowed, setP2pAllowed] = useState<string[]>(P2P_ALLOWED_FALLBACK);
   useEffect(() => {
-    import('@/lib/api').then(({ getAssets }) =>
-      getAssets().then((assets) => {
+    import('@/lib/api').then(({ getAssetsFull }) =>
+      getAssetsFull().then(({ assets, p2pAllowed: corridor }) => {
         if (Array.isArray(assets) && assets.length > 0) {
-          setAllTokens(assets.map(assetToToken));
+          const mapped = assets.map(assetToToken);
+          mapped.sort((a, b) => (b.venueVolume ?? 0) - (a.venueVolume ?? 0));
+          setAllTokens(mapped);
         }
+        if (Array.isArray(corridor) && corridor.length > 0) setP2pAllowed(corridor);
       })
     ).catch(() => {});
   }, []);
 
-  const p2pTokens = allTokens.filter((t) => P2P_ALLOWED.includes(t.symbol));
+  const p2pTokens = allTokens.filter((t) => p2pAllowed.includes(t.symbol));
+  const twapTokens = allTokens.filter((t) => t.twapEligible);
   const p2pLive = (symbol: string) =>
     p2pTokens.find((t) => t.symbol === symbol)?.status === 'live';
 
@@ -537,7 +584,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         tokenIn: tokenParam(tokenIn),
         tokenOut: tokenParam(tokenOut),
         amountIn: baseAmount,
-        slippage: 50,
+        slippage: instantSlippageBps,
       });
       const signed = await signTransaction(xdr);
       await submitTransaction(signed);
@@ -553,7 +600,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     } finally {
       setSubmitting(false);
     }
-  }, [walletAddress, quote, amountIn, tokenIn, tokenOut, tokenParam, signTransaction]);
+  }, [walletAddress, quote, amountIn, tokenIn, tokenOut, tokenParam, signTransaction, instantSlippageBps]);
 
   const formatOutput = (raw: string) => {
     if (!raw) return '0.00';
@@ -585,12 +632,22 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
               setQuote(null);
               setP2pPlan(null);
               if (tab.key === 'p2p') {
-                // Coerce selections into the P2P corridor
-                const nextIn = P2P_ALLOWED.includes(tokenIn) ? tokenIn : 'USDC';
+                // Coerce selections into the (server-configured) P2P corridor
+                const nextIn = p2pAllowed.includes(tokenIn) ? tokenIn : p2pAllowed[0];
+                const fallbackOut = p2pAllowed.find((s) => s !== nextIn) ?? p2pAllowed[0];
                 const nextOut =
-                  P2P_ALLOWED.includes(tokenOut) && tokenOut !== nextIn
+                  p2pAllowed.includes(tokenOut) && tokenOut !== nextIn ? tokenOut : fallbackOut;
+                setTokenIn(nextIn);
+                setTokenOut(nextOut);
+              }
+              if (tab.key === 'twap' && twapTokens.length >= 2) {
+                // Coerce into TWAP-eligible tokens (registered venue pools)
+                const eligible = (s: string) => twapTokens.some((t) => t.symbol === s);
+                const nextIn = eligible(tokenIn) ? tokenIn : twapTokens[0].symbol;
+                const nextOut =
+                  eligible(tokenOut) && tokenOut !== nextIn
                     ? tokenOut
-                    : nextIn === 'USDC' ? 'USDT0' : 'USDC';
+                    : twapTokens.find((t) => t.symbol !== nextIn)?.symbol ?? tokenOut;
                 setTokenIn(nextIn);
                 setTokenOut(nextOut);
               }
@@ -623,7 +680,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           value={amountIn}
           onChange={(v) => { setAmountIn(v); setP2pPlan(null); }}
           token={tokenIn}
-          tokens={mode === 'p2p' ? p2pTokens : allTokens}
+          tokens={mode === 'p2p' ? p2pTokens : mode === 'twap' ? twapTokens : allTokens}
           onTokenSelect={(s) => { setTokenIn(s); if (s === tokenOut) setTokenOut(tokenIn); setQuote(null); setP2pPlan(null); }}
           excludeToken={tokenOut}
           accent="#ef4444"
@@ -669,11 +726,54 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           }
           readOnly
           token={tokenOut}
-          tokens={mode === 'p2p' ? p2pTokens : allTokens}
+          tokens={mode === 'p2p' ? p2pTokens : mode === 'twap' ? twapTokens : allTokens}
           onTokenSelect={(s) => { setTokenOut(s); if (s === tokenIn) setTokenIn(tokenOut); setQuote(null); setP2pPlan(null); }}
           excludeToken={tokenIn}
           accent="#22c55e"
         />
+
+        {/* Instant options: slippage tolerance */}
+        {mode === 'instant' && (
+          <div style={{ marginTop: '12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', background: '#161b26', borderRadius: '12px', border: '1px solid #252a3a' }}>
+            <span style={{ fontSize: '12px', color: '#8a8f9c' }}>Slippage tolerance</span>
+            <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+              {[25, 50, 100].map((bps) => (
+                <button
+                  key={bps}
+                  onClick={() => setInstantSlippageBps(bps)}
+                  style={{
+                    padding: '5px 10px',
+                    borderRadius: '7px',
+                    border: instantSlippageBps === bps ? '1px solid #6366f1' : '1px solid #1a1f2e',
+                    background: instantSlippageBps === bps ? 'rgba(99, 102, 241, 0.1)' : 'transparent',
+                    color: instantSlippageBps === bps ? '#e1e4ea' : '#565b68',
+                    fontSize: '11px',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {(bps / 100).toFixed(2)}%
+                </button>
+              ))}
+              <input
+                type="number"
+                min={1}
+                max={1000}
+                value={[25, 50, 100].includes(instantSlippageBps) ? '' : instantSlippageBps}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value);
+                  if (Number.isInteger(v) && v >= 1 && v <= 1000) setInstantSlippageBps(v);
+                }}
+                placeholder="bps"
+                style={{
+                  width: '52px', padding: '5px 8px', background: '#0d1117',
+                  border: '1px solid #1a1f2e', borderRadius: '7px',
+                  color: '#e1e4ea', fontSize: '11px', outline: 'none',
+                }}
+              />
+            </div>
+          </div>
+        )}
 
         {/* TWAP Options: duration, limit, participation */}
         {mode === 'twap' && (
