@@ -794,6 +794,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "FeePer100k"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "100"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "FeeVault"
                           }
                         ]

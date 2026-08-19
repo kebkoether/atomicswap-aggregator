@@ -7,7 +7,7 @@
 | FeeVault | `CAIBVO2HVR77N6ZMUNFG23ORBONCJGKN7WSBYSMSDUFYTC43YJVASOWI` |
 | SwapBook | `CBPTU2MADELJOEPJWJIJUYXM36YFKQYMECNDIW6SFLZZ3XKABGZ44SVF` |
 | Router | `CD4EKANBDBF5NNV6BNJVPIHGZLLUKEXBB3QXZ3QWPOX5LNCEFPOJ2J6I` |
-| TwapBook | `CAMZXFZCGAQNVEMNV56W4ZTCY3ELUGQROXVXFWGCECUNQ3ZA3AQT3Q2Z` |
+| TwapBook (v2, settable fee) | `CCOFNUDEHVPZQSDLENYA6DGX3UTQQVYTUMG5ZBEYFIMNA4C3IQLPTONJ` |
 | Aqua adapter (v3) | `CC3P5UNO6PBVAKKQ7A6SJZ6G566X3VF2XNH5BFI7A3VFUGIMNPOP2HDY` |
 | Sushi adapter (v3) | `CDK4YWZSUEPCNDBA3VUVKXFLEKD2HWJ7JFXV5MEBGXWO6HNUO3YJ5D3R` |
 
@@ -30,8 +30,15 @@ permissionless slice + live AheadOfSchedule rejection + cancel refund,
 FeeVault withdrawal. **Contracts are unaudited — do not publicize or
 route size until the audit line in the deployment plan is met.**
 
-Superseded mainnet adapters (do not use): `CCYFDTWA…GR22` (v2, auth fix
-mis-ordered), plus one v1 with the allowance-based flow.
+TwapBook v2 (deployed 2026-08-19): protocol fee now admin-settable via
+`set_fee`, initialized at 10 bps with a compile-time hard cap of 10 bps
+(`MAX_FEE_PER_100K = 100`) — verifiable on-chain via `get_fee`. Venues 1
+(Aqua) and 2 (Sushi) re-registered. Set Railway
+`TWAP_BOOK_CONTRACT_ID=CCOFNUDEHVPZQSDLENYA6DGX3UTQQVYTUMG5ZBEYFIMNA4C3IQLPTONJ`.
+
+Superseded mainnet contracts (do not use): TwapBook v1
+`CAMZXFZC…3Q2Z` (fixed 0.5 bps fee), `CCYFDTWA…GR22` (adapter v2, auth fix
+mis-ordered), plus one adapter v1 with the allowance-based flow.
 
 ## Testnet (2026-08-13)
 

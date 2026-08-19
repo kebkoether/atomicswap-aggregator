@@ -98,13 +98,14 @@ fn seg(env: &Env, amount: i128) -> Vec<RouteSegment> {
     soroban_sdk::vec![env, RouteSegment { venue_id: 1, amount_in: amount, min_amount_out: 0 }]
 }
 
-/// Standard order: 1,000 A over 1,000 ledgers, limit 0.9995 B/A,
+/// Standard order: 1,000 A over 1,000 ledgers, limit 0.9985 B/A (leaves
+/// room for the 10 bps default fee on a 1:1 venue),
 /// 5% catch-up headroom, max slice 200 A, gap 10 ledgers.
 fn place_std(c: &Ctx) -> u64 {
     TwapBookClient::new(&c.env, &c.twap_id).place_twap(
         &c.maker, &c.token_a, &c.token_b,
         &TOTAL, &END,
-        &9995, &10000, // fixed limit 0.9995
+        &9985, &10000, // fixed limit 0.9985
         &0,
         &200_0000000, // max slice
         &10,          // min gap
@@ -173,8 +174,8 @@ fn test_slice_pays_maker_net_of_fee() {
     let amount = 50_0000000i128;
     let net = client.execute_slice(&id, &amount, &seg(&c.env, amount));
 
-    // fee = ceil(50e7 * 5 / 100000) = 25000
-    let fee = 25_000i128;
+    // fee = ceil(50e7 * 100 / 100000) = 500000 (10 bps default)
+    let fee = 500_000i128;
     assert_eq!(net, amount - fee);
     assert_eq!(TokenClient::new(&c.env, &c.token_b).balance(&c.maker), amount - fee);
     assert_eq!(TokenClient::new(&c.env, &c.token_b).balance(&c.fee_vault), fee);
@@ -182,6 +183,27 @@ fn test_slice_pays_maker_net_of_fee() {
     let order = client.get_order(&id);
     assert_eq!(order.filled_in, amount);
     assert_eq!(order.received_out, amount - fee);
+}
+
+#[test]
+fn test_fee_settable_within_cap() {
+    let c = setup(10_000);
+    let client = TwapBookClient::new(&c.env, &c.twap_id);
+    assert_eq!(client.get_fee(), (100, 100_000));
+
+    // Lower to 0.5 bps, verify a slice charges the new rate
+    client.set_fee(&5);
+    assert_eq!(client.get_fee(), (5, 100_000));
+    let id = place_std(&c);
+    let amount = 50_0000000i128;
+    let net = client.execute_slice(&id, &amount, &seg(&c.env, amount));
+    assert_eq!(net, amount - 25_000); // ceil(50e7 * 5 / 100000)
+
+    // Fee holiday is valid; above the cap or negative is not
+    client.set_fee(&0);
+    assert_eq!(client.get_fee(), (0, 100_000));
+    assert!(client.try_set_fee(&101).is_err());
+    assert!(client.try_set_fee(&-1).is_err());
 }
 
 #[test]
@@ -268,7 +290,7 @@ fn test_oracle_bound_order() {
         &200_0000000, &10, &500,
     );
 
-    // 1:1 venue clears the oracle bound easily (fee 0.5bps < 50bps slippage)
+    // 1:1 venue clears the oracle bound easily (fee 10bps < 50bps slippage)
     let a = 50_0000000i128;
     client.execute_slice(&id, &a, &seg(&c.env, a));
 
@@ -348,7 +370,7 @@ fn test_completion() {
     // Whole-order slice allowed: max_slice = total, no tolerance needed at end
     let id = client.place_twap(
         &c.maker, &c.token_a, &c.token_b, &TOTAL, &END,
-        &9995, &10000, &0,
+        &9985, &10000, &0,
         &TOTAL, &10, &500,
     );
 

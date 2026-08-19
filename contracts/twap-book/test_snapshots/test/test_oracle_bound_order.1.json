@@ -666,7 +666,7 @@
                       "symbol": "received_out"
                     },
                     "val": {
-                      "i128": "499975000"
+                      "i128": "499500000"
                     }
                   },
                   {
@@ -789,6 +789,18 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "FeePer100k"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "100"
                       }
                     },
                     {
@@ -1172,7 +1184,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "25000"
+                      "i128": "500000"
                     }
                   },
                   {
@@ -1224,7 +1236,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "499975000"
+                      "i128": "499500000"
                     }
                   },
                   {

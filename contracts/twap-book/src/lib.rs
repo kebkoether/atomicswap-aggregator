@@ -12,18 +12,23 @@
 //!               price, or a fresh oracle price ± slippage when no limit
 //!   3. CADENCE  a minimum ledger gap between slices
 //!
-//! Proceeds stream to the maker slice-by-slice (net of the 0.5 bps protocol
-//! fee). A misbehaving keeper can only make execution slower — never
-//! worse-priced. Unfilled remainder refunds on cancel (maker) or expiry
-//! (anyone).
+//! Proceeds stream to the maker slice-by-slice, net of the protocol fee.
+//! The fee is admin-settable but HARD-CAPPED on-chain at 10 bps
+//! (MAX_FEE_PER_100K) — makers can verify the ceiling and the admin can
+//! only ever lower the rate within it. A misbehaving keeper can only make
+//! execution slower — never worse-priced. Unfilled remainder refunds on
+//! cancel (maker) or expiry (anyone).
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
     symbol_short, token, Address, Env, IntoVal, Symbol, Vec, I256,
 };
 
-/// Protocol fee: 0.5 basis points = 5 per 100,000 (rounded up)
-const FEE_NUMERATOR: i128 = 5;
+/// Protocol fee is expressed per 100,000 of slice output (0.1 bp
+/// granularity), rounded up when charged. Admin-settable via set_fee,
+/// never above MAX_FEE_PER_100K. 100 per 100,000 = 10 bps = 0.10%.
+const MAX_FEE_PER_100K: i128 = 100;
+const DEFAULT_FEE_PER_100K: i128 = 100;
 const FEE_DENOMINATOR: i128 = 100_000;
 
 const BPS_DENOMINATOR: i128 = 10_000;
@@ -55,6 +60,8 @@ pub enum DataKey {
     ActiveIndex,
     /// venue_id -> adapter contract address (same registry shape as Router)
     Venue(u32),
+    /// Protocol fee numerator per FEE_DENOMINATOR (100,000)
+    FeePer100k,
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -151,6 +158,32 @@ impl TwapBook {
         env.storage()
             .instance()
             .set(&DataKey::ActiveIndex, &Vec::<u64>::new(&env));
+        env.storage()
+            .instance()
+            .set(&DataKey::FeePer100k, &DEFAULT_FEE_PER_100K);
+    }
+
+    /// Set the protocol fee (per 100,000 of slice output). Admin only,
+    /// hard-capped at MAX_FEE_PER_100K — the ceiling is compile-time and
+    /// cannot be raised without a new contract makers would have to opt
+    /// into. 0 is valid (fee holiday).
+    pub fn set_fee(env: Env, fee_per_100k: i128) -> Result<(), TwapError> {
+        Self::require_admin(&env)?;
+        if fee_per_100k < 0 || fee_per_100k > MAX_FEE_PER_100K {
+            return Err(TwapError::InvalidParams);
+        }
+        env.storage().instance().set(&DataKey::FeePer100k, &fee_per_100k);
+        env.events().publish(
+            (symbol_short!("twap"), symbol_short!("fee")),
+            fee_per_100k,
+        );
+        Ok(())
+    }
+
+    /// Current protocol fee as (numerator, denominator) — e.g. (100, 100000)
+    /// = 10 bps. Denominator is always FEE_DENOMINATOR.
+    pub fn get_fee(env: Env) -> (i128, i128) {
+        (Self::fee_per_100k(&env), FEE_DENOMINATOR)
     }
 
     /// Register a venue adapter (same push-funds interface as the Router's).
@@ -341,7 +374,7 @@ impl TwapBook {
         Self::validate_segments(&segments, amount_in)?;
         let total_out = Self::execute_segments(&env, &order.token_in, &order.token_out, &segments)?;
 
-        let fee = Self::muldiv_ceil(&env, total_out, FEE_NUMERATOR, FEE_DENOMINATOR);
+        let fee = Self::muldiv_ceil(&env, total_out, Self::fee_per_100k(&env), FEE_DENOMINATOR);
         let net_out = total_out - fee;
 
         // ── PRICE FLOOR ──
@@ -455,6 +488,13 @@ impl TwapBook {
     }
 
     // ─── Internal ───────────────────────────────────────
+
+    fn fee_per_100k(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeePer100k)
+            .unwrap_or(DEFAULT_FEE_PER_100K)
+    }
 
     fn require_admin(env: &Env) -> Result<(), TwapError> {
         let admin: Address = env
