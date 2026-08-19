@@ -162,15 +162,14 @@ export default function Header() {
                   <button
                     onClick={() => {
                       setMenuOpen(false);
-                      // Freighter reconnects silently while authorized — to
-                      // switch accounts, change the active account in the
-                      // Freighter extension, then reconnect.
+                      // Opens the Wallets Kit picker — choose any supported
+                      // wallet (Freighter, xBull, LOBSTR, Albedo, Hana, …)
                       disconnect();
                       setTimeout(() => connect(), 100);
                     }}
                     style={menuItemStyle}
                   >
-                    Reconnect / switch account
+                    Switch wallet
                   </button>
                   <button
                     onClick={() => {
