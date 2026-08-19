@@ -28,6 +28,20 @@ export interface TokenConfig {
  * These need to be populated after running the above command for each asset.
  */
 export const TOKENS: Record<string, TokenConfig> = {
+  // Native lumens. The SAC address is a network-wide constant on mainnet.
+  // XLM must be in this registry: the timer-sweep keeper only scans pairs
+  // of registry tokens, and the only Router-executable venue pools today
+  // are XLM/USDC — without this entry the sweep could never route any
+  // expired order (found live 2026-08-19: a USDC→XLM timer order sat
+  // unswept to expiry while the keeper scanned stable-stable pairs only).
+  XLM: {
+    symbol: 'XLM',
+    name: 'Stellar Lumens',
+    issuer: '', // native asset — no issuer
+    sacAddress: 'CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA',
+    decimals: 7,
+    status: 'live',
+  },
   USDC: {
     symbol: 'USDC',
     name: 'USD Coin (Circle)',
