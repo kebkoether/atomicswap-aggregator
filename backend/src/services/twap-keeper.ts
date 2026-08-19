@@ -32,6 +32,7 @@ interface TwapOrderState {
   limitDen: bigint;
   maxSliceIn: bigint;
   minSliceGap: number;
+  paceToleranceBps: number;
   lastSliceLedger: number;
   status: string;
 }
@@ -137,6 +138,7 @@ export class TwapKeeperService {
       limitDen: BigInt(raw.limit_den ?? 0),
       maxSliceIn: BigInt(raw.max_slice_in ?? 0),
       minSliceGap: Number(raw.min_slice_gap ?? 0),
+      paceToleranceBps: Number(raw.pace_tolerance_bps ?? 0),
       lastSliceLedger: Number(raw.last_slice_ledger ?? 0),
       status: scEnum(raw.status),
     };
@@ -168,16 +170,43 @@ export class TwapKeeperService {
       return;
     }
 
-    // Pace deficit: aim for the on-schedule level (not the tolerance ceiling)
+    // Pace target. Normal flight aims for the on-schedule (pro-rata) level —
+    // true TWAP behavior. But that line only reaches 100% AT end_ledger,
+    // when it's too late to slice: an on-schedule-only keeper strands the
+    // final slice-interval of volume in every order. So in the END-GAME —
+    // when the ledgers left can't fit the gap-separated slices the
+    // remainder needs — target the pace CEILING (schedule + the maker's
+    // tolerance band) so the order completes inside the window. The
+    // contract enforces the ceiling either way; tolerance 0 makers opt out
+    // of end-game and accept the tail refund.
     const elapsed = BigInt(Math.max(0, currentLedger - order.startLedger));
     const duration = BigInt(order.endLedger - order.startLedger);
     const onSchedule = (order.totalIn * elapsed) / duration;
+    const headroom = (order.totalIn * BigInt(order.paceToleranceBps)) / 10_000n;
     const remaining = order.totalIn - order.filledIn;
-    let slice = onSchedule - order.filledIn;
-    if (slice <= 0n) return; // on pace or ahead — wait
+
+    const ledgersLeft = BigInt(Math.max(0, order.endLedger - currentLedger));
+    const slicesNeeded = (remaining + order.maxSliceIn - 1n) / order.maxSliceIn;
+    const ledgersNeeded = BigInt(order.minSliceGap) * slicesNeeded + 18n; // +~2 ticks safety
+    const endGame = ledgersLeft <= ledgersNeeded;
+
+    let slice = endGame
+      ? onSchedule + headroom - order.filledIn
+      : onSchedule - order.filledIn;
+    if (slice <= 0n) return; // on pace (or at ceiling) — wait
     if (slice > order.maxSliceIn) slice = order.maxSliceIn;
     if (slice > remaining) slice = remaining;
     if (slice <= 0n) return;
+
+    // Pace visibility: a widening lag means slices are failing or skipped —
+    // surface it so stalls are diagnosable from logs.
+    const lag = onSchedule - order.filledIn;
+    if (lag * 10n > order.totalIn) {
+      console.warn(
+        `[TwapKeeper] order #${id}: ${lag} behind schedule (${order.filledIn}/${order.totalIn} filled, ` +
+        `${ledgersLeft} ledgers left${endGame ? ', END-GAME' : ''})`
+      );
+    }
 
     // Route over Router-executable venues (venue ids match TwapBook registry)
     let route;
