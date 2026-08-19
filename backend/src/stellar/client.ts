@@ -158,24 +158,36 @@ export class StellarClient {
     destAsset: InstanceType<typeof Asset>;
     destMin: string;    // display units, 7dp string
     path: InstanceType<typeof Asset>[];
+    /** Optional integrator fee: paid in destAsset from the swapper to the
+     *  partner's address as a second op in the same tx (classic txs allow
+     *  multiple ops; ops are atomic — swap fails, fee never leaves). The
+     *  destination must hold a trustline for destAsset. */
+    partnerPayment?: { destination: string; amount: string };
   }): Promise<string> {
     const account = await this.server.getAccount(opts.sourceAddress);
-    const tx = new TransactionBuilder(account, {
+    const builder = new TransactionBuilder(account, {
       fee: '10000',
       networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(
-        Operation.pathPaymentStrictSend({
-          sendAsset: opts.sendAsset,
-          sendAmount: opts.sendAmount,
-          destination: opts.sourceAddress, // self-swap
-          destAsset: opts.destAsset,
-          destMin: opts.destMin,
-          path: opts.path,
+    }).addOperation(
+      Operation.pathPaymentStrictSend({
+        sendAsset: opts.sendAsset,
+        sendAmount: opts.sendAmount,
+        destination: opts.sourceAddress, // self-swap
+        destAsset: opts.destAsset,
+        destMin: opts.destMin,
+        path: opts.path,
+      })
+    );
+    if (opts.partnerPayment) {
+      builder.addOperation(
+        Operation.payment({
+          destination: opts.partnerPayment.destination,
+          asset: opts.destAsset,
+          amount: opts.partnerPayment.amount,
         })
-      )
-      .setTimeout(300)
-      .build();
+      );
+    }
+    const tx = builder.setTimeout(300).build();
     return tx.toXDR();
   }
 

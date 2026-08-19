@@ -313,7 +313,8 @@ async function buildClassicSwap(
   tokenOut: string,
   amountIn: bigint,
   expectedOut: bigint,
-  slippageBps: number
+  slippageBps: number,
+  partnerPayment?: { destination: string; amount: bigint }
 ): Promise<string> {
   const sendAsset = classicAssetFor(tokenIn);
   const destAsset = classicAssetFor(tokenOut);
@@ -350,7 +351,48 @@ async function buildClassicSwap(
     destAsset,
     destMin: toDisplay7(destMin > 0n ? destMin : 1n),
     path,
+    partnerPayment:
+      partnerPayment && partnerPayment.amount > 0n
+        ? { destination: partnerPayment.destination, amount: toDisplay7(partnerPayment.amount) }
+        : undefined,
   });
+}
+
+/**
+ * Best-execution comparison shared by /api/swap/build and the v1
+ * integrator API: Soroban route (Router-executable venues) vs the classic
+ * SDEX path. Classic ops can't be Router segments (Soroban contracts
+ * cannot submit classic operations), so when SDEX wins the user signs a
+ * classic path-payment-strict-send directly.
+ */
+async function computeBestExecution(
+  tokenIn: string,
+  tokenOut: string,
+  amountIn: bigint,
+  slippage: number
+): Promise<{
+  kind: 'classic' | 'soroban';
+  route: Awaited<ReturnType<typeof routingEngine.computeRoute>> | null;
+  sdexOut: bigint;
+}> {
+  let route: Awaited<ReturnType<typeof routingEngine.computeRoute>> | null = null;
+  try {
+    route = await routingEngine.computeRoute(tokenIn, tokenOut, amountIn, slippage, {
+      executableOnly: true,
+    });
+  } catch {
+    route = null;
+  }
+  const routeNet = route && route.instructions.length > 0 ? route.netAmountOut : 0n;
+
+  const sdexAdapter = registry.get(3);
+  let sdexOut = 0n;
+  if (sdexAdapter && (await sdexAdapter.isAvailable())) {
+    try {
+      sdexOut = (await sdexAdapter.getQuote(tokenIn, tokenOut, amountIn)).amountOut;
+    } catch {}
+  }
+  return { kind: sdexOut > routeNet ? 'classic' : 'soroban', route, sdexOut };
 }
 
 // ─── API Routes ─────────────────────────────────────────
@@ -548,30 +590,9 @@ app.post('/api/swap/build', async (req, res) => {
     const amountIn = parseAmount(req.body.amountIn, 'amountIn');
     const slippage = parseSlippageBps(req.body.slippage);
 
-    // Route across venues the Router contract can actually execute
-    let route: Awaited<ReturnType<typeof routingEngine.computeRoute>> | null = null;
-    try {
-      route = await routingEngine.computeRoute(tokenIn, tokenOut, amountIn, slippage, {
-        executableOnly: true,
-      });
-    } catch {
-      route = null;
-    }
-    const routeNet = route && route.instructions.length > 0 ? route.netAmountOut : 0n;
+    const { kind, route, sdexOut } = await computeBestExecution(tokenIn, tokenOut, amountIn, slippage);
 
-    // Compare against the classic SDEX/classic-AMM route. Classic ops can't
-    // be Router segments (Soroban contracts cannot submit classic
-    // operations) — when SDEX wins, the user signs a classic
-    // path-payment-strict-send directly (the Soroswap pattern).
-    const sdexAdapter = registry.get(3);
-    let sdexOut = 0n;
-    if (sdexAdapter && (await sdexAdapter.isAvailable())) {
-      try {
-        sdexOut = (await sdexAdapter.getQuote(tokenIn, tokenOut, amountIn)).amountOut;
-      } catch {}
-    }
-
-    if (sdexOut > routeNet) {
+    if (kind === 'classic') {
       const xdr = await buildClassicSwap(sourceAddress, tokenIn, tokenOut, amountIn, sdexOut, slippage);
       res.json({
         xdr,
@@ -1110,6 +1131,220 @@ app.get('/api/health', async (_req, res) => {
     },
     network: config.rpcUrl,
   });
+});
+
+// ─── Integrator API v1 ──────────────────────────────────
+//
+// Public REST surface for wallet integrators (the Meru/AirTM/Beans
+// pattern), mirroring the Soroswap API shape wallets already know:
+// quote → build (unsigned XDR — the PARTNER'S USER signs, we never touch
+// keys) → send. Keyed and rate-limited per partner.
+//
+// Keys: INTEGRATOR_API_KEYS env, comma-separated "name:key" pairs:
+//   INTEGRATOR_API_KEYS=meru:ak_live_abc,airtm:ak_live_xyz
+// Send the key as `x-api-key` or `Authorization: Bearer <key>`.
+//
+// Partner economics: feeBps (0..100 = up to 1%) + referralAddress. On
+// classic (SDEX) routes the fee is a second payment op in the same tx —
+// atomic with the swap, paid in tokenOut, requires the referral address
+// to hold a trustline for it. Soroban-routed swaps return
+// partnerFeeCollected:false until the Router contract grows a fee-split
+// entry point (tracked follow-up); quotes still report which kind won so
+// partners can decide.
+
+const INTEGRATOR_KEYS = new Map<string, string>(); // api key -> partner name
+for (const pair of (process.env.INTEGRATOR_API_KEYS ?? '').split(',')) {
+  const idx = pair.indexOf(':');
+  if (idx <= 0) continue;
+  const name = pair.slice(0, idx).trim();
+  const key = pair.slice(idx + 1).trim();
+  if (name && key.length >= 16) INTEGRATOR_KEYS.set(key, name);
+}
+const V1_RATE_LIMIT_PER_MIN = parseInt(process.env.V1_RATE_LIMIT_PER_MIN || '120', 10);
+const MAX_PARTNER_FEE_BPS = 100;
+const v1Buckets = new Map<string, { count: number; windowStart: number }>();
+
+function v1Auth(req: any, res: any, next: any): void {
+  const header = req.headers['x-api-key'] ?? req.headers.authorization ?? '';
+  const key = String(header).replace(/^Bearer\s+/i, '').trim();
+  const partner = INTEGRATOR_KEYS.get(key);
+  if (!partner) {
+    res.status(401).json({ error: 'invalid or missing API key' });
+    return;
+  }
+  const now = Date.now();
+  let bucket = v1Buckets.get(key);
+  if (!bucket || now - bucket.windowStart >= 60_000) {
+    bucket = { count: 0, windowStart: now };
+    v1Buckets.set(key, bucket);
+  }
+  bucket.count += 1;
+  if (bucket.count > V1_RATE_LIMIT_PER_MIN) {
+    res.status(429).json({
+      error: 'rate limit exceeded',
+      limitPerMinute: V1_RATE_LIMIT_PER_MIN,
+      retryAfterSeconds: Math.ceil((bucket.windowStart + 60_000 - now) / 1000),
+    });
+    return;
+  }
+  req.partner = partner;
+  next();
+}
+
+function parsePartnerFee(body: any): { feeBps: number; referralAddress: string | null } {
+  const feeBps = body.feeBps === undefined ? 0 : Number(body.feeBps);
+  if (!Number.isInteger(feeBps) || feeBps < 0 || feeBps > MAX_PARTNER_FEE_BPS) {
+    throw new BadRequest(`feeBps must be an integer 0..${MAX_PARTNER_FEE_BPS}`);
+  }
+  let referralAddress: string | null = null;
+  if (feeBps > 0) {
+    referralAddress = parseStellarAccount(body.referralAddress, 'referralAddress');
+  }
+  return { feeBps, referralAddress };
+}
+
+/** GET /v1/health — auth check + which partner the key belongs to. */
+app.get('/v1/health', v1Auth, (req: any, res) => {
+  res.json({ status: 'ok', partner: req.partner, network: config.rpcUrl });
+});
+
+/** GET /v1/tokens — tradeable token universe with venue-volume ranking. */
+app.get('/v1/tokens', v1Auth, (_req, res) => {
+  res.json({
+    tokens: tokenDiscovery.getTokens().map((t: any) => ({
+      symbol: t.symbol,
+      name: t.name,
+      contract: t.sacAddress,
+      issuer: t.issuer ?? null,
+      decimals: 7,
+      verified: t.verified ?? false,
+      venueVolume: t.venueVolume ?? 0,
+    })),
+  });
+});
+
+/**
+ * POST /v1/quote
+ * Body: assetIn, assetOut (symbol or SAC contract), amount (base units,
+ * string), slippageBps? (default 50), feeBps? (partner fee, 0..100).
+ * EXACT_IN only. Quotes are indicative; /v1/quote/build re-prices.
+ */
+app.post('/v1/quote', v1Auth, async (req, res) => {
+  try {
+    const assetIn = resolveTokenParam(req.body.assetIn, 'assetIn');
+    const assetOut = resolveTokenParam(req.body.assetOut, 'assetOut');
+    const amount = parseAmount(req.body.amount, 'amount');
+    const slippage = parseSlippageBps(req.body.slippageBps);
+    const { feeBps } = parsePartnerFee(req.body);
+
+    const { kind, route, sdexOut } = await computeBestExecution(assetIn, assetOut, amount, slippage);
+    const grossOut = kind === 'classic' ? sdexOut : route?.netAmountOut ?? 0n;
+    if (grossOut <= 0n) throw new BadRequest('No liquidity for this pair');
+
+    const partnerFee = (grossOut * BigInt(feeBps)) / 10000n;
+    const netOut = grossOut - partnerFee;
+    res.json({
+      assetIn,
+      assetOut,
+      amountIn: amount.toString(),
+      amountOut: netOut.toString(),
+      partnerFee: partnerFee.toString(),
+      partnerFeeCollected: kind === 'classic' || feeBps === 0,
+      minAmountOut: ((netOut * BigInt(10000 - slippage)) / 10000n).toString(),
+      kind,
+      segments:
+        kind === 'classic'
+          ? [{ venue: 'StellarDEX (classic)', amountIn: amount.toString(), expectedOut: sdexOut.toString() }]
+          : route!.segments.map((s) => ({
+              venue: s.venueName,
+              amountIn: s.amountIn.toString(),
+              expectedOut: s.expectedAmountOut.toString(),
+            })),
+    });
+  } catch (error) {
+    handleError(res, error, 'Failed to quote');
+  }
+});
+
+/**
+ * POST /v1/quote/build
+ * Body: everything /v1/quote takes, plus `from` (the user's address that
+ * will sign) and `referralAddress` (required when feeBps > 0; must hold a
+ * trustline for assetOut). Returns { xdr, kind, partnerFeeCollected } —
+ * hand the XDR to the user's wallet to sign, then POST /v1/send.
+ */
+app.post('/v1/quote/build', v1Auth, async (req, res) => {
+  try {
+    const from = parseStellarAccount(req.body.from, 'from');
+    const assetIn = resolveTokenParam(req.body.assetIn, 'assetIn');
+    const assetOut = resolveTokenParam(req.body.assetOut, 'assetOut');
+    const amount = parseAmount(req.body.amount, 'amount');
+    const slippage = parseSlippageBps(req.body.slippageBps);
+    const { feeBps, referralAddress } = parsePartnerFee(req.body);
+
+    const { kind, route, sdexOut } = await computeBestExecution(assetIn, assetOut, amount, slippage);
+
+    if (kind === 'classic') {
+      const partnerFee = (sdexOut * BigInt(feeBps)) / 10000n;
+      const xdr = await buildClassicSwap(
+        from, assetIn, assetOut, amount, sdexOut, slippage,
+        referralAddress && partnerFee > 0n
+          ? { destination: referralAddress, amount: partnerFee }
+          : undefined
+      );
+      res.json({
+        xdr,
+        kind,
+        partnerFee: partnerFee.toString(),
+        partnerFeeCollected: partnerFee > 0n,
+        expectedOut: (sdexOut - partnerFee).toString(),
+      });
+      return;
+    }
+
+    if (!route || route.instructions.length === 0) {
+      throw new BadRequest('No executable venue liquidity for this pair');
+    }
+    const minTotalOut = (route.netAmountOut * BigInt(10000 - slippage)) / 10000n;
+    if (minTotalOut <= 0n) throw new BadRequest('Route output too small');
+    const xdr = await stellar.buildTransaction(from, config.routerContractId, 'execute_route', [
+      StellarClient.toAddress(from),
+      StellarClient.toAddress(assetIn),
+      StellarClient.toAddress(assetOut),
+      StellarClient.toI128(route.totalAmountIn),
+      StellarClient.toI128(minTotalOut),
+      StellarClient.toRouteSegments(
+        route.instructions.map((i) => ({
+          venueId: i.venueId,
+          amountIn: i.amountIn,
+          minAmountOut: i.minAmountOut,
+        }))
+      ),
+    ]);
+    res.json({
+      xdr,
+      kind,
+      partnerFee: '0',
+      partnerFeeCollected: false, // Soroban fee-split lands with Router v2
+      expectedOut: route.netAmountOut.toString(),
+    });
+  } catch (error) {
+    handleError(res, error, 'Failed to build transaction');
+  }
+});
+
+/** POST /v1/send — submit a signed XDR. Body: { xdr }. */
+app.post('/v1/send', v1Auth, async (req, res) => {
+  try {
+    const xdr = req.body.xdr;
+    if (typeof xdr !== 'string' || xdr.length === 0 || xdr.length > 100_000) {
+      throw new BadRequest('xdr must be a signed transaction XDR string');
+    }
+    const result = await stellar.submitTransaction(xdr);
+    res.json({ status: result.status, result });
+  } catch (error) {
+    handleError(res, error, 'Failed to submit transaction');
+  }
 });
 
 // ─── Start Server ───────────────────────────────────────
