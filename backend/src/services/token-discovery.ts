@@ -45,6 +45,13 @@ export interface AggregatedToken {
   source: 'curated' | 'aqua';
   /** Curated entries are verified; venue-discovered ones are not */
   verified: boolean;
+  /**
+   * Aggregate venue volume across all pools containing this token
+   * (Aqua's lifetime total_volume units). Free byproduct of the pool
+   * sweep — used by the UI to rank the "hot" tokens first without any
+   * extra queries.
+   */
+  venueVolume: number;
 }
 
 export class TokenDiscoveryService {
@@ -94,16 +101,21 @@ export class TokenDiscoveryService {
    * venue-discovered tokens that pass the anti-spoof rules.
    */
   getTokens(): AggregatedToken[] {
-    const curated: AggregatedToken[] = Object.values(TOKENS).map((t) => ({
-      symbol: t.symbol,
-      name: t.name,
-      issuer: t.issuer,
-      sacAddress: t.sacAddress || this.autoFillSac(t) || '',
-      decimals: t.decimals,
-      status: t.status,
-      source: 'curated',
-      verified: true,
-    }));
+    const volumeBySac = this.volumeBySac();
+    const curated: AggregatedToken[] = Object.values(TOKENS).map((t) => {
+      const sac = t.sacAddress || this.autoFillSac(t) || '';
+      return {
+        symbol: t.symbol,
+        name: t.name,
+        issuer: t.issuer,
+        sacAddress: sac,
+        decimals: t.decimals,
+        status: t.status,
+        source: 'curated' as const,
+        verified: true,
+        venueVolume: volumeBySac.get(sac) ?? 0,
+      };
+    });
 
     const curatedSymbols = new Set(curated.map((t) => t.symbol.toUpperCase()));
     const curatedSacs = new Set(curated.map((t) => t.sacAddress).filter(Boolean));
@@ -112,11 +124,23 @@ export class TokenDiscoveryService {
     for (const token of this.discovered.values()) {
       if (curatedSacs.has(token.sacAddress)) continue; // already curated
       if (curatedSymbols.has(token.symbol.toUpperCase())) continue; // spoof guard
-      extras.push(token);
+      extras.push({ ...token, venueVolume: volumeBySac.get(token.sacAddress) ?? 0 });
     }
     extras.sort((a, b) => a.symbol.localeCompare(b.symbol));
 
     return [...curated, ...extras];
+  }
+
+  /** Sum pool volumes per token SAC (pools below the spam floor excluded). */
+  private volumeBySac(): Map<string, number> {
+    const map = new Map<string, number>();
+    for (const pool of this.pools) {
+      if (pool.txCount < this.minTxCount) continue;
+      for (const sac of pool.tokenAddresses) {
+        map.set(sac, (map.get(sac) ?? 0) + (pool.totalVolume || 0));
+      }
+    }
+    return map;
   }
 
   /** All discovered pools containing both SACs (for adapter registration/quotes). */
@@ -217,6 +241,7 @@ export class TokenDiscoveryService {
           status: 'live',
           source: 'aqua',
           verified: false,
+          venueVolume: 0, // filled from the pool sweep in getTokens()
         });
       }
     }
