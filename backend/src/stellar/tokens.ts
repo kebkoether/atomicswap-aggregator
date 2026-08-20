@@ -61,7 +61,7 @@ export const TOKENS: Record<string, TokenConfig> = {
   USDY: {
     symbol: 'USDY',
     name: 'Ondo US Dollar Yield',
-    issuer: '', // Check: https://docs.ondo.finance/addresses
+    issuer: 'GAJMPX5NBOG6TQFPQGRABJEEB2YE7RFRLUKJDZAZGAD5GFX4J7TADAZ6',
     sacAddress: '',
     decimals: 7,
     status: 'live',
