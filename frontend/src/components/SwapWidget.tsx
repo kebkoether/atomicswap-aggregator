@@ -648,18 +648,49 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
       // The backend picks the best execution: Soroban route (Aqua/Sushi via
       // the Router contract) or a classic SDEX path payment — either way
       // it's one XDR to sign.
-      const { xdr, kind, route } = await buildSwap({
+      const data = await buildSwap({
         sourceAddress: walletAddress,
         tokenIn: tokenParam(tokenIn),
         tokenOut: tokenParam(tokenOut),
         amountIn: baseAmount,
         slippage: instantSlippageBps,
       });
-      const signed = await signTransaction(xdr);
-      await submitTransaction(signed);
-      const via = kind === 'classic'
-        ? 'Stellar DEX (classic)'
-        : (route?.segments || []).map((s: any) => s.venue).join(' + ') || 'DEX route';
+      const { kind, route } = data;
+      let via: string;
+      if (kind === 'blend' && Array.isArray(data.legs)) {
+        // Split execution: SDEX chunk (classic tx) + AMM chunk (Router tx).
+        // Two signatures; each leg carries its own min-out, so a rejected
+        // or failed second leg means "partially executed", never a worse
+        // price than quoted.
+        let done = 0;
+        try {
+          for (const leg of data.legs) {
+            const signed = await signTransaction(leg.xdr);
+            await submitTransaction(signed);
+            done++;
+          }
+        } catch (err: any) {
+          if (done > 0) {
+            alert(
+              `Partially executed: part 1 of your swap filled, part 2 was ` +
+              `cancelled or failed (${err?.message || 'unknown error'}). ` +
+              `The unswapped portion is still in your wallet.`
+            );
+            setQuote(null);
+            fetchBalances();
+            return;
+          }
+          throw err;
+        }
+        via = (route?.segments || []).map((s: any) => s.venue).join(' + ') + ' (split for better price)';
+      } else {
+        if (!data.xdr) throw new Error('Backend returned no transaction to sign');
+        const signed = await signTransaction(data.xdr);
+        await submitTransaction(signed);
+        via = kind === 'classic'
+          ? 'Stellar DEX (classic)'
+          : (route?.segments || []).map((s: any) => s.venue).join(' + ') || 'DEX route';
+      }
       alert(`Swap submitted via ${via}. Check your wallet balance.`);
       setAmountIn('');
       setQuote(null);

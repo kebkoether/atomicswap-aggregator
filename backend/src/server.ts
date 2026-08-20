@@ -364,35 +364,95 @@ async function buildClassicSwap(
  * SDEX path. Classic ops can't be Router segments (Soroban contracts
  * cannot submit classic operations), so when SDEX wins the user signs a
  * classic path-payment-strict-send directly.
+ *
+ * BLENDED execution: when the optimal allocation mixes SDEX and AMM
+ * liquidity (thin book with a tight inside quote), the single-tx
+ * either/or leaves money on the table. The allocator runs once more with
+ * the SDEX included as a venue; if the mixed allocation beats the best
+ * single route by more than the gate (both a bps floor and an absolute
+ * floor — so dust swaps and fee-eating gains never trigger it), we return
+ * a two-transaction plan. Both legs carry their own min-out, so the
+ * failure mode of losing atomicity is "one leg didn't execute," never a
+ * worse price. The user experience is one extra wallet approval, shown
+ * only when it pays for itself.
  */
+const BLEND_MIN_GAIN_BPS = BigInt(process.env.BLEND_MIN_GAIN_BPS || '10');
+const BLEND_MIN_GAIN_UNITS = BigInt(process.env.BLEND_MIN_GAIN_UNITS || '1000000'); // 0.1 token-out
+
+interface BlendPlan {
+  sdexIn: bigint;
+  sdexOut: bigint;
+  ammIn: bigint;
+  /** AMM leg output net of the Router's 0.5 bps protocol fee */
+  ammNet: bigint;
+  blendNet: bigint;
+  gain: bigint;
+  mixed: Awaited<ReturnType<typeof routingEngine.computeRoute>>;
+}
+
 async function computeBestExecution(
   tokenIn: string,
   tokenOut: string,
   amountIn: bigint,
   slippage: number
 ): Promise<{
-  kind: 'classic' | 'soroban';
+  /** Best plan including the blend (only /api/swap/build handles 'blend') */
+  kind: 'classic' | 'soroban' | 'blend';
+  /** Best single-transaction plan — what the v1 integrator API uses */
+  singleKind: 'classic' | 'soroban';
   route: Awaited<ReturnType<typeof routingEngine.computeRoute>> | null;
   sdexOut: bigint;
+  blend: BlendPlan | null;
 }> {
-  let route: Awaited<ReturnType<typeof routingEngine.computeRoute>> | null = null;
-  try {
-    route = await routingEngine.computeRoute(tokenIn, tokenOut, amountIn, slippage, {
-      executableOnly: true,
-    });
-  } catch {
-    route = null;
-  }
-  const routeNet = route && route.instructions.length > 0 ? route.netAmountOut : 0n;
-
   const sdexAdapter = registry.get(3);
-  let sdexOut = 0n;
-  if (sdexAdapter && (await sdexAdapter.isAvailable())) {
-    try {
-      sdexOut = (await sdexAdapter.getQuote(tokenIn, tokenOut, amountIn)).amountOut;
-    } catch {}
+  const [route, sdexOut, mixed] = await Promise.all([
+    routingEngine
+      .computeRoute(tokenIn, tokenOut, amountIn, slippage, { executableOnly: true })
+      .catch(() => null),
+    (async () => {
+      if (!sdexAdapter || !(await sdexAdapter.isAvailable())) return 0n;
+      try {
+        return (await sdexAdapter.getQuote(tokenIn, tokenOut, amountIn)).amountOut;
+      } catch {
+        return 0n;
+      }
+    })(),
+    routingEngine
+      .computeRoute(tokenIn, tokenOut, amountIn, slippage, {
+        executableOnly: true,
+        includeClassicDex: true,
+      })
+      .catch(() => null),
+  ]);
+
+  const routeNet = route && route.instructions.length > 0 ? route.netAmountOut : 0n;
+  const singleKind: 'classic' | 'soroban' = sdexOut > routeNet ? 'classic' : 'soroban';
+  const singleBest = sdexOut > routeNet ? sdexOut : routeNet;
+
+  let blend: BlendPlan | null = null;
+  if (mixed) {
+    const sdexSegs = mixed.segments.filter((s) => s.venueId === 3);
+    const ammSegs = mixed.segments.filter((s) => s.venueId !== 3);
+    if (sdexSegs.length > 0 && ammSegs.length > 0 && singleBest > 0n) {
+      const sum = (xs: bigint[]) => xs.reduce((a, b) => a + b, 0n);
+      const sdexIn = sum(sdexSegs.map((s) => s.amountIn));
+      const sdexMixOut = sum(sdexSegs.map((s) => s.expectedAmountOut));
+      const ammIn = sum(ammSegs.map((s) => s.amountIn));
+      const ammOut = sum(ammSegs.map((s) => s.expectedAmountOut));
+      // Router charges 0.5 bps on the AMM leg's output; the classic leg
+      // pays no protocol fee (the engine's own fee model charges the
+      // total, which over-counts the SDEX portion — recompute here).
+      const ammFee = ammOut > 0n ? (ammOut * 5n + 100_000n - 1n) / 100_000n : 0n;
+      const ammNet = ammOut - ammFee;
+      const blendNet = sdexMixOut + ammNet;
+      const gain = blendNet - singleBest;
+      if (gain >= BLEND_MIN_GAIN_UNITS && gain * 10_000n >= singleBest * BLEND_MIN_GAIN_BPS) {
+        blend = { sdexIn, sdexOut: sdexMixOut, ammIn, ammNet, blendNet, gain, mixed };
+      }
+    }
   }
-  return { kind: sdexOut > routeNet ? 'classic' : 'soroban', route, sdexOut };
+
+  return { kind: blend ? 'blend' : singleKind, singleKind, route, sdexOut, blend };
 }
 
 // ─── API Routes ─────────────────────────────────────────
@@ -590,9 +650,60 @@ app.post('/api/swap/build', async (req, res) => {
     const amountIn = parseAmount(req.body.amountIn, 'amountIn');
     const slippage = parseSlippageBps(req.body.slippage);
 
-    const { kind, route, sdexOut } = await computeBestExecution(tokenIn, tokenOut, amountIn, slippage);
+    const { kind, singleKind, route, sdexOut, blend } = await computeBestExecution(tokenIn, tokenOut, amountIn, slippage);
 
-    if (kind === 'classic') {
+    // Blended execution: SDEX chunk as a classic tx + AMM chunk through the
+    // Router — two signatures, each leg min-out protected. Only returned
+    // when the gain clears the gate (see computeBestExecution).
+    if (kind === 'blend' && blend) {
+      const classicXdr = await buildClassicSwap(
+        sourceAddress, tokenIn, tokenOut, blend.sdexIn, blend.sdexOut, slippage
+      );
+      const ammMinOut = (blend.ammNet * BigInt(10000 - slippage)) / 10000n;
+      const ammInstructions = blend.mixed.instructions.filter((i) => i.venueId !== 3);
+      const sorobanXdr = await stellar.buildTransaction(
+        sourceAddress,
+        config.routerContractId,
+        'execute_route',
+        [
+          StellarClient.toAddress(sourceAddress),
+          StellarClient.toAddress(tokenIn),
+          StellarClient.toAddress(tokenOut),
+          StellarClient.toI128(blend.ammIn),
+          StellarClient.toI128(ammMinOut > 0n ? ammMinOut : 1n),
+          StellarClient.toRouteSegments(
+            ammInstructions.map((i) => ({
+              venueId: i.venueId,
+              amountIn: i.amountIn,
+              minAmountOut: i.minAmountOut,
+            }))
+          ),
+        ]
+      );
+      res.json({
+        kind: 'blend',
+        legs: [
+          { kind: 'classic', xdr: classicXdr, amountIn: blend.sdexIn.toString(), expectedOut: blend.sdexOut.toString() },
+          { kind: 'soroban', xdr: sorobanXdr, amountIn: blend.ammIn.toString(), expectedOut: blend.ammNet.toString() },
+        ],
+        route: {
+          totalAmountIn: amountIn.toString(),
+          netAmountOut: blend.blendNet.toString(),
+          minTotalOut: ((blend.blendNet * BigInt(10000 - slippage)) / 10000n).toString(),
+          blendedBps: Number(((amountIn - blend.blendNet) * 10000n) / amountIn),
+          blendGain: blend.gain.toString(),
+          segments: blend.mixed.segments.map((s) => ({
+            venue: s.venueId === 3 ? 'StellarDEX (classic)' : s.venueName,
+            venueId: s.venueId,
+            amountIn: s.amountIn.toString(),
+            expectedOut: s.expectedAmountOut.toString(),
+          })),
+        },
+      });
+      return;
+    }
+
+    if (singleKind === 'classic') {
       const xdr = await buildClassicSwap(sourceAddress, tokenIn, tokenOut, amountIn, sdexOut, slippage);
       res.json({
         xdr,
@@ -1237,7 +1348,7 @@ app.post('/v1/quote', v1Auth, async (req, res) => {
     const slippage = parseSlippageBps(req.body.slippageBps);
     const { feeBps } = parsePartnerFee(req.body);
 
-    const { kind, route, sdexOut } = await computeBestExecution(assetIn, assetOut, amount, slippage);
+    const { singleKind: kind, route, sdexOut } = await computeBestExecution(assetIn, assetOut, amount, slippage);
     const grossOut = kind === 'classic' ? sdexOut : route?.netAmountOut ?? 0n;
     if (grossOut <= 0n) throw new BadRequest('No liquidity for this pair');
 
@@ -1282,7 +1393,7 @@ app.post('/v1/quote/build', v1Auth, async (req, res) => {
     const slippage = parseSlippageBps(req.body.slippageBps);
     const { feeBps, referralAddress } = parsePartnerFee(req.body);
 
-    const { kind, route, sdexOut } = await computeBestExecution(assetIn, assetOut, amount, slippage);
+    const { singleKind: kind, route, sdexOut } = await computeBestExecution(assetIn, assetOut, amount, slippage);
 
     if (kind === 'classic') {
       const partnerFee = (sdexOut * BigInt(feeBps)) / 10000n;
