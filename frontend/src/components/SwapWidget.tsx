@@ -14,6 +14,8 @@ interface Token {
   status: 'live' | 'coming_soon';
   /** SAC contract address (preferred API identifier when present) */
   sacAddress?: string;
+  /** Classic asset issuer — used to match Horizon trustline balances */
+  issuer?: string;
   /** Curated registry entries are verified; venue-discovered ones are not */
   verified?: boolean;
   /** Aggregate venue volume — powers hot-first ordering */
@@ -57,6 +59,7 @@ function assetToToken(asset: any): Token {
     letterBg: style.letterBg,
     status: asset.status,
     sacAddress: asset.sacAddress || undefined,
+    issuer: asset.issuer || undefined,
     verified: asset.verified ?? asset.source === 'curated',
     venueVolume: asset.venueVolume ?? 0,
     twapEligible: asset.twapEligible ?? false,
@@ -66,6 +69,18 @@ function assetToToken(asset: any): Token {
 // Fallback P2P corridor — replaced at runtime by the backend's p2pAllowed
 // (P2P_ALLOWED_TOKENS env), so the corridor is a server-side product knob.
 const P2P_ALLOWED_FALLBACK = ['USDC', 'USDT0'];
+
+// Horizon serves wallet balances directly (public CORS API) — one call
+// per wallet covers XLM + every classic trustline.
+const HORIZON_URL = (process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE ?? '').startsWith('Public Global')
+  ? 'https://horizon.stellar.org'
+  : 'https://horizon-testnet.stellar.org';
+
+function formatBalance(raw: string): string {
+  const v = parseFloat(raw);
+  if (!Number.isFinite(v)) return '--';
+  return v.toLocaleString('en-US', { maximumFractionDigits: 4 });
+}
 
 // ─── Token Icon ─────────────────────────────────────────
 
@@ -383,6 +398,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
       getTwapFee().then((f) => { if (f) setTwapFeeBps(f.feeBps); })
     );
   }, [mode, twapFeeBps]);
+
   const [loading, setLoading] = useState(false);
   const [quote, setQuote] = useState<any>(null);
   const [p2pPlan, setP2pPlan] = useState<any>(null);
@@ -397,6 +413,49 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   // at the top of the dropdown. Falls back to the curated list offline.
   const [allTokens, setAllTokens] = useState<Token[]>(TOKENS);
   const [p2pAllowed, setP2pAllowed] = useState<string[]>(P2P_ALLOWED_FALLBACK);
+
+  // Wallet balances by symbol, from Horizon. XLM matches the native line;
+  // classic assets match on (code, issuer) against the token universe.
+  const [balances, setBalances] = useState<Record<string, string>>({});
+  const fetchBalances = useCallback(async () => {
+    if (!walletAddress) {
+      setBalances({});
+      return;
+    }
+    try {
+      const res = await fetch(`${HORIZON_URL}/accounts/${walletAddress}`);
+      if (!res.ok) return; // unfunded accounts 404 — keep whatever we had
+      const data = await res.json();
+      const next: Record<string, string> = {};
+      for (const b of data.balances ?? []) {
+        if (b.asset_type === 'native') {
+          next['XLM'] = b.balance;
+        } else if (b.asset_code) {
+          const match = allTokens.find(
+            (t) => t.symbol === b.asset_code && t.issuer === b.asset_issuer
+          );
+          if (match) next[match.symbol] = b.balance;
+        }
+      }
+      setBalances(next);
+    } catch {
+      // Network hiccup — leave the previous snapshot in place
+    }
+  }, [walletAddress, allTokens]);
+
+  useEffect(() => { fetchBalances(); }, [fetchBalances]);
+
+  const balanceLabel = useCallback(
+    (symbol: string): string => {
+      if (!walletAddress) return 'Balance: --';
+      if (balances[symbol] !== undefined) return `Balance: ${formatBalance(balances[symbol])}`;
+      // Connected + known classic asset but no trustline → genuinely zero.
+      const t = allTokens.find((x) => x.symbol === symbol);
+      if (symbol === 'XLM' || t?.issuer) return 'Balance: 0';
+      return 'Balance: --';
+    },
+    [walletAddress, balances, allTokens]
+  );
   useEffect(() => {
     import('@/lib/api').then(({ getAssetsFull }) =>
       getAssetsFull().then(({ assets, p2pAllowed: corridor }) => {
@@ -530,13 +589,14 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         `Proceeds stream to your wallet as slices fill — track it on the Orders page.`
       );
       setAmountIn('');
+      fetchBalances();
     } catch (error: any) {
       console.error('TWAP submit error:', error);
       alert(`Failed to start TWAP: ${error?.message || 'Unknown error'}`);
     } finally {
       setSubmitting(false);
     }
-  }, [walletAddress, amountIn, tokenIn, tokenOut, twapDurationMin, twapLimitPrice, twapMaxSlicePct, maxSlippageBps, tokenParam, signTransaction]);
+  }, [walletAddress, amountIn, tokenIn, tokenOut, twapDurationMin, twapLimitPrice, twapMaxSlicePct, maxSlippageBps, tokenParam, signTransaction, fetchBalances]);
 
   // Submit the P2P order (sign + send the transaction)
   const handleP2pSubmit = useCallback(async () => {
@@ -566,6 +626,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         alert('Order placed successfully! Check the Orders tab to see it.');
         setP2pPlan(null);
         setAmountIn('');
+        fetchBalances();
       } else {
         alert('Order plan ready but no transactions to sign yet. The smart contracts need SAC addresses configured to build real transactions.');
       }
@@ -575,7 +636,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     } finally {
       setSubmitting(false);
     }
-  }, [walletAddress, p2pPlan, amountIn, tokenIn, tokenOut, priceMode, maxSlippageBps, autoRouteMinutes, signTransaction]);
+  }, [walletAddress, p2pPlan, amountIn, tokenIn, tokenOut, priceMode, maxSlippageBps, autoRouteMinutes, signTransaction, fetchBalances]);
 
   // Handle instant swap execution
   const handleInstantSwap = useCallback(async () => {
@@ -602,13 +663,14 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
       alert(`Swap submitted via ${via}. Check your wallet balance.`);
       setAmountIn('');
       setQuote(null);
+      fetchBalances();
     } catch (error: any) {
       console.error('Swap error:', error);
       alert(`Failed: ${error?.message || 'Unknown error'}`);
     } finally {
       setSubmitting(false);
     }
-  }, [walletAddress, quote, amountIn, tokenIn, tokenOut, tokenParam, signTransaction, instantSlippageBps]);
+  }, [walletAddress, quote, amountIn, tokenIn, tokenOut, tokenParam, signTransaction, instantSlippageBps, fetchBalances]);
 
   const formatOutput = (raw: string) => {
     if (!raw) return '0.00';
@@ -684,7 +746,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         {/* Selling */}
         <InputPanel
           label="Selling"
-          sublabel="Balance: --"
+          sublabel={balanceLabel(tokenIn)}
           value={amountIn}
           onChange={(v) => { setAmountIn(v); setP2pPlan(null); }}
           token={tokenIn}
@@ -722,7 +784,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         {/* Buying */}
         <InputPanel
           label={mode === 'instant' ? 'Buying' : 'Buying (estimated)'}
-          sublabel={loading ? 'Fetching...' : 'Balance: --'}
+          sublabel={loading ? 'Fetching...' : balanceLabel(tokenOut)}
           value={
             (mode === 'instant' || mode === 'twap') && quote
               ? `${mode === 'twap' ? '~' : ''}${formatOutput(quote.netAmountOut)}`
