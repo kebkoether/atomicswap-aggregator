@@ -99,12 +99,17 @@ export class RoutingEngine {
     tokenOut: string,
     amountIn: bigint,
     slippageBps: number = 50, // default 0.5% slippage tolerance
-    opts: { executableOnly?: boolean } = {}
+    opts: { executableOnly?: boolean; includeClassicDex?: boolean } = {}
   ): Promise<Route> {
     // 1. Get all available venues
     let venues = await this.registry.getAvailable();
     if (opts.executableOnly) {
-      venues = venues.filter((v) => v.executable);
+      // includeClassicDex keeps the SDEX (venue 3) in the allocation even
+      // though it isn't Router-executable — used for blended execution,
+      // where the SDEX portion becomes a separate classic transaction.
+      venues = venues.filter(
+        (v) => v.executable || (opts.includeClassicDex === true && v.venueId === 3)
+      );
     }
 
     if (venues.length === 0) {

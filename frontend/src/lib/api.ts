@@ -173,7 +173,14 @@ export async function buildSwap(body: {
   tokenOut: string;
   amountIn: string;
   slippage?: number;
-}): Promise<{ xdr: string; kind: 'soroban' | 'classic'; route: any }> {
+}): Promise<{
+  /** Present for single-transaction plans (kind 'soroban' | 'classic') */
+  xdr?: string;
+  kind: 'soroban' | 'classic' | 'blend';
+  /** Present for kind 'blend': sign and submit each leg in order */
+  legs?: Array<{ kind: 'soroban' | 'classic'; xdr: string; amountIn: string; expectedOut: string }>;
+  route: any;
+}> {
   const response = await fetch(`${API_BASE}/api/swap/build`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
