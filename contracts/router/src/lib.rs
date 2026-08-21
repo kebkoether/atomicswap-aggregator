@@ -175,7 +175,7 @@ impl Router {
 
         // Pull total token_in from user
         let token_in_client = token::Client::new(&env, &token_in);
-        token_in_client.transfer(&user, &env.current_contract_address(), &total_amount_in);
+        token_in_client.transfer(&user, env.current_contract_address(), &total_amount_in);
 
         let total_out = Self::execute_segments(&env, &token_in, &token_out, &segments)?;
 

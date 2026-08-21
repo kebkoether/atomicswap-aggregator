@@ -6,11 +6,11 @@
 //! keeper) then executes slices through registered venue adapters. The
 //! contract — not the keeper — enforces the three constraints that matter:
 //!
-//!   1. PACE     cumulative fill may not run ahead of the schedule
-//!               (plus a bounded tolerance band for catch-up)
-//!   2. PRICE    every slice's net proceeds must clear the maker's limit
-//!               price, or a fresh oracle price ± slippage when no limit
-//!   3. CADENCE  a minimum ledger gap between slices
+//!   1. PACE — cumulative fill may not run ahead of the schedule
+//!      (plus a bounded tolerance band for catch-up)
+//!   2. PRICE — every slice's net proceeds must clear the maker's limit
+//!      price, or a fresh oracle price ± slippage when no limit
+//!   3. CADENCE — a minimum ledger gap between slices
 //!
 //! Proceeds stream to the maker slice-by-slice, net of the protocol fee.
 //! The fee is admin-settable but HARD-CAPPED on-chain at 10 bps
@@ -169,7 +169,7 @@ impl TwapBook {
     /// into. 0 is valid (fee holiday).
     pub fn set_fee(env: Env, fee_per_100k: i128) -> Result<(), TwapError> {
         Self::require_admin(&env)?;
-        if fee_per_100k < 0 || fee_per_100k > MAX_FEE_PER_100K {
+        if !(0..=MAX_FEE_PER_100K).contains(&fee_per_100k) {
             return Err(TwapError::InvalidParams);
         }
         env.storage().instance().set(&DataKey::FeePer100k, &fee_per_100k);
@@ -275,7 +275,7 @@ impl TwapBook {
         // Escrow
         token::Client::new(&env, &token_in).transfer(
             &maker,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &total_in,
         );
 

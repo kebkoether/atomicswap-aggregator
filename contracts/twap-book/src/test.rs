@@ -49,6 +49,7 @@ struct Ctx {
     token_a: Address,
     token_b: Address,
     maker: Address,
+    #[allow(dead_code)]
     admin: Address,
 }
 
