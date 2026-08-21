@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useWallet } from '@/context/WalletContext';
+import Logo from '@/components/Logo';
 
 const IS_MAINNET = (process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE ?? '').startsWith('Public Global');
 
@@ -51,23 +52,7 @@ export default function Header() {
       >
         {/* Logo */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <div
-            style={{
-              width: '36px',
-              height: '36px',
-              borderRadius: '10px',
-              background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              fontSize: '18px',
-              fontWeight: 700,
-              color: 'white',
-              letterSpacing: '-1px',
-            }}
-          >
-            U
-          </div>
+          <Logo size={36} />
           <span
             style={{
               fontSize: '18px',
