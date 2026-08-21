@@ -1458,7 +1458,7 @@ app.post('/v1/quote', v1Auth, async (req, res) => {
     const assetOut = resolveTokenParam(req.body.assetOut, 'assetOut');
     const amount = parseAmount(req.body.amount, 'amount');
     const slippage = parseSlippageBps(req.body.slippageBps);
-    const { feeBps } = parsePartnerFee(req.body);
+    const { feeBps, referralAddress } = parsePartnerFee(req.body);
 
     const { singleKind: kind, route, sdexOut } = await computeBestExecution(assetIn, assetOut, amount, slippage);
     const grossOut = kind === 'classic' ? sdexOut : route?.netAmountOut ?? 0n;
@@ -1472,7 +1472,10 @@ app.post('/v1/quote', v1Auth, async (req, res) => {
       amountIn: amount.toString(),
       amountOut: netOut.toString(),
       partnerFee: partnerFee.toString(),
-      partnerFeeCollected: kind === 'classic' || feeBps === 0 || config.swapbookV11,
+      partnerFeeCollected:
+        kind === 'classic' ||
+        feeBps === 0 ||
+        (config.swapbookV11 && referralAddress !== null),
       minAmountOut: ((netOut * BigInt(10000 - slippage)) / 10000n).toString(),
       kind,
       segments:
