@@ -1180,18 +1180,30 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
               border: '1px solid #161b26',
             }}
           >
-            {[
-              { label: 'Rate', value: `1 ${tokenIn} ≈ 1.0000 ${tokenOut}` },
-              {
-                label: 'Our fee',
-                value: parseInt(quote.swapBookAmountOut ?? '0') > 0
-                  ? `0.5 bps on P2P portion`
-                  : 'None — all via DEXs',
-                color: parseInt(quote.swapBookAmountOut ?? '0') > 0 ? '#22c55e' : '#8a8f9c',
-              },
-              { label: 'DEX venue costs', value: `~${Math.max(0, (quote.blendedBps ?? 0)).toFixed(1)} bps`, color: '#eab308' },
-              { label: 'Total cost', value: `${(quote.blendedBps ?? 0).toFixed(1)} bps`, color: '#6366f1', bold: true },
-            ].map((row: any) => (
+            {(() => {
+              // Live rate from the actual quote: tokenOut received per tokenIn.
+              const inAmt = Number(quote.amountIn ?? 0);
+              const outAmt = Number(quote.netAmountOut ?? 0);
+              const rate = inAmt > 0 ? outAmt / inAmt : 0;
+              const rateStr = rate > 0
+                ? `1 ${tokenIn} ≈ ${rate.toLocaleString('en-US', { maximumSignificantDigits: 5 })} ${tokenOut}`
+                : '—';
+              // Protocol fee expressed against the output, in bps.
+              const feeBps = outAmt > 0 ? (Number(quote.protocolFee ?? 0) / outAmt) * 10000 : 0;
+              const impactBps = Math.max(0, quote.priceImpactBps ?? 0);
+              return [
+                { label: 'Rate', value: rateStr },
+                {
+                  label: 'Our fee',
+                  value: parseInt(quote.swapBookAmountOut ?? '0') > 0
+                    ? `0.5 bps on P2P portion`
+                    : 'None — all via DEXs',
+                  color: parseInt(quote.swapBookAmountOut ?? '0') > 0 ? '#22c55e' : '#8a8f9c',
+                },
+                { label: 'Price impact', value: `~${impactBps.toFixed(1)} bps`, color: '#eab308' },
+                { label: 'Total cost', value: `${(impactBps + feeBps).toFixed(1)} bps`, color: '#6366f1', bold: true },
+              ];
+            })().map((row: any) => (
               <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', padding: '3px 0' }}>
                 <span style={{ fontSize: '13px', color: '#565b68' }}>{row.label}</span>
                 <span style={{ fontSize: '13px', color: row.color || '#8a8f9c', fontWeight: row.bold ? 600 : 400 }}>
