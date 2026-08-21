@@ -24,5 +24,7 @@ Resolved recently:
   accrual → withdrawal (`contracts/integration-tests`), run in CI.
 - Clippy gate in CI (`-D warnings` with three documented allows).
 - `cargo audit` in CI: 0 vulnerabilities as of 2026-08-21.
+- CoinFabrik Scout scan: all 7 crates analyzed, 0 findings at every
+  severity ([SCANS.md](./SCANS.md)).
 - Threat model + dataflow diagram (THREAT_MODEL.md), security policy
   (SECURITY.md), Apache-2.0 license, pinned Rust toolchain.
