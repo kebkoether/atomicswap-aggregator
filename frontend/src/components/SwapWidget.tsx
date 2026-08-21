@@ -513,7 +513,8 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           const baseAmount = Math.floor(parseFloat(amount) * 1e7).toString();
           const data = await fetchQuote(tokenParam(tIn), tokenParam(tOut), baseAmount);
           setQuote(data);
-          onRouteComputed(data);
+          // Symbols ride along so RoutePreview can label amounts correctly
+          onRouteComputed({ ...data, tokenInSymbol: tIn, tokenOutSymbol: tOut });
         } catch (error) {
           console.error('Quote error:', error);
         } finally {
