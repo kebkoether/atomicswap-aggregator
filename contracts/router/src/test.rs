@@ -93,6 +93,9 @@ fn setup(venue_rate_bps: i128) -> TestCtx {
     let venue_id = env.register(MockVenue, (venue_rate_bps,));
     StellarAssetClient::new(&env, &token_b).mint(&venue_id, &10_000_000_0000000);
     RouterClient::new(&env, &router_id).register_venue(&1u32, &venue_id);
+    // v1.1 defaults the protocol fee to 0; these tests exercise the fee
+    // math at the historical 0.5 bps rate.
+    RouterClient::new(&env, &router_id).set_fee(&5);
 
     TestCtx {
         env,
@@ -289,7 +292,14 @@ fn test_venue_registry() {
 fn test_router_fee_settable_within_cap() {
     let t = setup(10_000); // 1:1 venue
     let client = RouterClient::new(&t.env, &t.router_id);
-    assert_eq!(client.get_fee(), (5, 100_000));
+    assert_eq!(client.get_fee(), (5, 100_000)); // setup() sets 5
+
+    // The v1.1 DEFAULT is zero — a freshly deployed router charges nothing
+    let fresh = t.env.register(
+        Router,
+        (Address::generate(&t.env), t.fee_vault.clone(), t.swapbook_id.clone()),
+    );
+    assert_eq!(RouterClient::new(&t.env, &fresh).get_fee(), (0, 100_000));
 
     // Fee holiday: user receives the full venue output
     client.set_fee(&0);
@@ -306,4 +316,48 @@ fn test_router_fee_settable_within_cap() {
     client.set_fee(&5);
     assert!(client.try_set_fee(&6).is_err());
     assert!(client.try_set_fee(&-1).is_err());
+}
+
+// ─── v1.1: integrator partner fee split ──────────────────
+
+#[test]
+fn test_partner_fee_split_is_additive() {
+    let t = setup(10_000); // 1:1 venue, protocol fee 5/100k from setup
+    let client = RouterClient::new(&t.env, &t.router_id);
+    let partner = Address::generate(&t.env);
+
+    let amount = 10_000_0000000i128;
+    let protocol_fee = (amount * 5 + 100_000 - 1) / 100_000;
+    let partner_fee = (amount * 100 + 100_000 - 1) / 100_000; // 10 bps
+    let expected_net = amount - protocol_fee - partner_fee;
+
+    let segments = soroban_sdk::vec![&t.env, seg(1, amount, amount)];
+    let received = client.execute_route_partner(
+        &t.user, &t.token_a, &t.token_b,
+        &amount, &expected_net, &segments,
+        &partner, &100,
+    );
+    assert_eq!(received, expected_net);
+    // Partner got their cut, protocol got its full fee — additive, not split
+    let token_b = TokenClient::new(&t.env, &t.token_b);
+    assert_eq!(token_b.balance(&partner), partner_fee);
+    assert_eq!(token_b.balance(&t.fee_vault), protocol_fee);
+    assert_eq!(token_b.balance(&t.user), expected_net);
+
+    // Cap: >100 bps rejected; user floor protects net of BOTH fees
+    assert!(client
+        .try_execute_route_partner(
+            &t.user, &t.token_a, &t.token_b,
+            &amount, &1, &soroban_sdk::vec![&t.env, seg(1, amount, 0)],
+            &partner, &1_001,
+        )
+        .is_err());
+    assert!(client
+        .try_execute_route_partner(
+            &t.user, &t.token_a, &t.token_b,
+            &amount, &(expected_net + 1),
+            &soroban_sdk::vec![&t.env, seg(1, amount, 0)],
+            &partner, &100,
+        )
+        .is_err());
 }

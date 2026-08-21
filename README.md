@@ -155,17 +155,24 @@ v1.1 — all tested, awaiting deployment + backend `SWAPBOOK_V11=1`:
   a pair have feeds, prices come exclusively from the SEP-40 oracle (fail
   closed on stale/missing); other pairs keep the guarded pushed price.
 - **Settable fees, hard-capped**: SwapBook and Router fees are now
-  admin-settable 0–0.5 bps (compile-time cap, like TwapBook's 10 bps) —
-  fee holidays possible, raising above the deployed cap is not.
+  admin-settable 0–0.5 bps (compile-time cap, like TwapBook's 10 bps).
+  The Router DEFAULTS TO ZERO — instant swaps are venue-fees-only, as the
+  UI says; P2P keeps its advertised 0.5 bps.
+- **Partner fee-split on Soroban legs**: `execute_route_partner` carves
+  the integrator's fee (≤ 100 bps) from the output ON TOP of the protocol
+  fee and pays it on-chain — closes the classic-legs-only gap.
 - Backend: peer-swap plans prefer organic makers over protocol liquidity
-  wallets, and skip orders that exclude the taker.
+  wallets, and skip orders that exclude the taker; `/v1` uses the on-chain
+  partner split when enabled.
+- **Off-chain wallet screening** (`SCREENING_PROVIDER`): denylist or
+  Predicate policy API, enforced at every build endpoint plus a
+  connect-time `GET /api/screen/:address` — the contracts themselves stay
+  permissionless by design.
 
 ## Known gaps / next up
 
 - **Deploy v1.1** (addresses will supersede DEPLOYMENTS.md) and flip
   `SWAPBOOK_V11=1` + `SWAPBOOK_CONTRACT_ID` on Railway.
-- **Router partner-fee split**: integrator `feeBps` collects on classic legs
-  today; Soroban legs need a fee-split entry point in the Router.
 - **Indexer**: the Postgres schema in `backend/src/db/schema.sql` has no
   writer yet — consume the contract events (`order placed/filled/...`).
 - **Audit** before public launch (of the v1.1 contract set).
