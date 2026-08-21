@@ -58,7 +58,27 @@ const config = {
   sushiAdapterContractId: process.env.SUSHI_ADAPTER_CONTRACT_ID ?? '',
   twapBookContractId: process.env.TWAP_BOOK_CONTRACT_ID ?? '',
   horizonUrl: process.env.HORIZON_URL ?? 'https://horizon-testnet.stellar.org',
+  /**
+   * v1.1 SwapBook features (match_and_place, excluded counterparties).
+   * Leave unset while the deployed SwapBook is v1.0 — the extra arg /
+   * new entry point would fail against it. Flip after deploying v1.1
+   * and updating SWAPBOOK_CONTRACT_ID.
+   */
+  swapbookV11: ['1', 'true'].includes((process.env.SWAPBOOK_V11 ?? '').toLowerCase()),
 };
+
+/**
+ * Protocol-operated liquidity wallets (e.g. SDF-supported inventory).
+ * Two effects: (1) peer-swap plans route takers to ORGANIC makers first
+ * and only fall back to these wallets, so growing volume naturally
+ * displaces them; (2) with v1.1, orders placed FROM one of these wallets
+ * automatically exclude the others on-chain, so the liquidity can never
+ * cross itself.
+ */
+const SDF_LIQUIDITY_WALLETS = (process.env.SDF_LIQUIDITY_WALLETS ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 /**
  * P2P (SwapBook) is scoped to this corridor. The on-chain book is
@@ -219,6 +239,8 @@ interface ChainOrder {
   minAmountOut: bigint;
   expiry: number;
   priceMode: string;
+  /** v1.1: addresses that may not fill this order (empty on v1.0 orders) */
+  excluded: string[];
   raw: any;
 }
 
@@ -234,6 +256,7 @@ function normalizeOrder(raw: any): ChainOrder | null {
       minAmountOut: BigInt(raw.min_amount_out ?? 0),
       expiry: Number(raw.expiry ?? 0),
       priceMode: scEnum(raw.price_mode),
+      excluded: Array.isArray(raw.excluded) ? raw.excluded.map(String) : [],
       raw,
     };
   } catch {
@@ -811,10 +834,22 @@ app.post('/api/peer-swap/build', async (req, res) => {
       throw new BadRequest('autoRouteMinutes must be a non-negative number');
     }
 
-    // 1. Reverse-side sitting orders are our matches
-    const reverseOrders = (await fetchOrdersForPair(tokenOut, tokenIn)).filter(
-      (o) => isOpen(o) && o.priceMode === 'Fixed' && o.amountIn > 0n
+    // 1. Reverse-side sitting orders are our matches. Skip the taker's
+    //    own orders and any order that excludes this taker (v1.1).
+    const candidates = (await fetchOrdersForPair(tokenOut, tokenIn)).filter(
+      (o) =>
+        isOpen(o) &&
+        o.priceMode === 'Fixed' &&
+        o.amountIn > 0n &&
+        o.maker !== sourceAddress &&
+        !o.excluded.includes(sourceAddress)
     );
+    // Organic liquidity first; protocol-operated (SDF) wallets are the
+    // fallback — so growing organic volume naturally displaces them.
+    const reverseOrders = [
+      ...candidates.filter((o) => !SDF_LIQUIDITY_WALLETS.includes(o.maker)),
+      ...candidates.filter((o) => SDF_LIQUIDITY_WALLETS.includes(o.maker)),
+    ];
 
     // 2. Greedy fill planning (ceiling payments — mirrors contract rounding)
     let budget = amountInBig;
@@ -856,74 +891,128 @@ app.post('/api/peer-swap/build', async (req, res) => {
     const totalBought = fills.reduce((s, f) => s + f.fillAmountIn, 0n);
     const totalPaid = fills.reduce((s, f) => s + f.paymentOut, 0n);
 
-    // 3. Build transactions
+    // 3. Shared placement parameters for any escrowed remainder
+    const currentLedger = await stellar.getLatestLedger();
+    const orderExpiry = Number.isInteger(req.body.expiry) && req.body.expiry > currentLedger
+      ? Number(req.body.expiry)
+      : currentLedger + DEFAULT_EXPIRY_LEDGERS;
+    const autoRouteAfter =
+      autoRouteMinutes > 0
+        ? currentLedger + Math.ceil((autoRouteMinutes * 60) / LEDGER_SECONDS)
+        : 0;
+    // Pro-rata min for the sitting remainder (round up — protects the maker)
+    const proRataMinOut =
+      amountToSit > 0n ? muldivCeil(minOutBig, amountToSit, amountInBig) : 0n;
+
+    // Excluded counterparties (v1.1 contracts only). Protocol-operated
+    // liquidity wallets automatically exclude their siblings — the
+    // inventory can never cross itself on-chain. Other makers may pass
+    // their own list (≤ 5, the contract cap).
+    let excluded: string[] = [];
+    if (SDF_LIQUIDITY_WALLETS.includes(sourceAddress)) {
+      excluded = SDF_LIQUIDITY_WALLETS.filter((w) => w !== sourceAddress);
+    } else if (Array.isArray(req.body.excludedCounterparties)) {
+      excluded = req.body.excludedCounterparties.map((a: unknown, i: number) =>
+        parseStellarAccount(a, `excludedCounterparties[${i}]`)
+      );
+    }
+    if (excluded.length > 5) {
+      throw new BadRequest('excludedCounterparties: at most 5 addresses');
+    }
+
+    // 4. Build transactions
     const xdrs: string[] = [];
-    for (const fill of fills) {
-      const method = fill.full ? 'fill_order' : 'partial_fill';
-      const args = fill.full
-        ? [
+    if (config.swapbookV11) {
+      // v1.1: ONE atomic invocation — fills settle and the remainder
+      // escrows in the same transaction, so the book can't move mid-plan.
+      xdrs.push(
+        await stellar.buildTransaction(
+          sourceAddress,
+          config.swapbookContractId,
+          'match_and_place',
+          [
             StellarClient.toAddress(sourceAddress),
-            StellarClient.toU64(fill.orderId),
-            StellarClient.toI128(fill.paymentOut),
+            StellarClient.toAddress(tokenIn),
+            StellarClient.toAddress(tokenOut),
+            StellarClient.toI128(amountInBig),
+            StellarClient.toI128(priceModeVal === 1 ? 0n : proRataMinOut),
+            StellarClient.toU32(orderExpiry),
+            StellarClient.toU32(priceModeVal),
+            StellarClient.toU32(priceModeVal === 1 ? slippageBps : 0),
+            StellarClient.toU32(autoRouteAfter),
+            StellarClient.toAddressVec(excluded),
+            StellarClient.toFillSpecs(
+              fills.map((f) => ({
+                orderId: f.orderId,
+                fillAmountIn: f.fillAmountIn,
+                amountOut: f.paymentOut,
+              }))
+            ),
           ]
-        : [
-            StellarClient.toAddress(sourceAddress),
-            StellarClient.toU64(fill.orderId),
-            StellarClient.toI128(fill.fillAmountIn),
-            StellarClient.toI128(fill.paymentOut),
-          ];
-      try {
+        )
+      );
+    } else {
+      // v1.0 contracts: separate transactions per fill + placement
+      for (const fill of fills) {
+        const method = fill.full ? 'fill_order' : 'partial_fill';
+        const args = fill.full
+          ? [
+              StellarClient.toAddress(sourceAddress),
+              StellarClient.toU64(fill.orderId),
+              StellarClient.toI128(fill.paymentOut),
+            ]
+          : [
+              StellarClient.toAddress(sourceAddress),
+              StellarClient.toU64(fill.orderId),
+              StellarClient.toI128(fill.fillAmountIn),
+              StellarClient.toI128(fill.paymentOut),
+            ];
+        try {
+          xdrs.push(
+            await stellar.buildTransaction(
+              sourceAddress,
+              config.swapbookContractId,
+              method,
+              args
+            )
+          );
+        } catch (err) {
+          console.warn(`Could not build fill tx for order ${fill.orderId}:`, err);
+        }
+      }
+
+      if (amountToSit > 0n) {
         xdrs.push(
           await stellar.buildTransaction(
             sourceAddress,
             config.swapbookContractId,
-            method,
-            args
+            'place_order',
+            [
+              StellarClient.toAddress(sourceAddress),
+              StellarClient.toAddress(tokenIn),
+              StellarClient.toAddress(tokenOut),
+              StellarClient.toI128(amountToSit),
+              StellarClient.toI128(priceModeVal === 1 ? 0n : proRataMinOut),
+              StellarClient.toU32(orderExpiry),
+              StellarClient.toU32(priceModeVal),
+              StellarClient.toU32(priceModeVal === 1 ? slippageBps : 0),
+              StellarClient.toU32(autoRouteAfter),
+            ]
           )
         );
-      } catch (err) {
-        console.warn(`Could not build fill tx for order ${fill.orderId}:`, err);
       }
     }
 
-    let remainderPlan: Record<string, unknown> | null = null;
-    if (amountToSit > 0n) {
-      const currentLedger = await stellar.getLatestLedger();
-      const orderExpiry = Number.isInteger(req.body.expiry) && req.body.expiry > currentLedger
-        ? Number(req.body.expiry)
-        : currentLedger + DEFAULT_EXPIRY_LEDGERS;
-      const autoRouteAfter =
-        autoRouteMinutes > 0
-          ? currentLedger + Math.ceil((autoRouteMinutes * 60) / LEDGER_SECONDS)
-          : 0;
-      // Pro-rata min for the sitting remainder (round up — protects the maker)
-      const proRataMinOut = muldivCeil(minOutBig, amountToSit, amountInBig);
-
-      const placeXdr = await stellar.buildTransaction(
-        sourceAddress,
-        config.swapbookContractId,
-        'place_order',
-        [
-          StellarClient.toAddress(sourceAddress),
-          StellarClient.toAddress(tokenIn),
-          StellarClient.toAddress(tokenOut),
-          StellarClient.toI128(amountToSit),
-          StellarClient.toI128(priceModeVal === 1 ? 0n : proRataMinOut),
-          StellarClient.toU32(orderExpiry),
-          StellarClient.toU32(priceModeVal),
-          StellarClient.toU32(priceModeVal === 1 ? slippageBps : 0),
-          StellarClient.toU32(autoRouteAfter),
-        ]
-      );
-      xdrs.push(placeXdr);
-      remainderPlan = {
-        amountIn: amountToSit.toString(),
-        minAmountOut: proRataMinOut.toString(),
-        expiry: orderExpiry,
-        autoRouteAfter,
-        status: 'will_escrow',
-      };
-    }
+    const remainderPlan: Record<string, unknown> | null =
+      amountToSit > 0n
+        ? {
+            amountIn: amountToSit.toString(),
+            minAmountOut: proRataMinOut.toString(),
+            expiry: orderExpiry,
+            autoRouteAfter,
+            status: 'will_escrow',
+          }
+        : null;
 
     res.json({
       plan: {

@@ -198,8 +198,7 @@ fn test_route_expired_order_pays_maker_atomically() {
     let order_id = book.place_order(
         &t.maker, &t.token_a, &t.token_b,
         &amount, &min_out, &10_000,
-        &0, &0, &150,
-    );
+        &0, &0, &150, &soroban_sdk::vec![&t.env]);
 
     t.env.ledger().with_mut(|li| li.sequence_number = 200);
 
@@ -232,8 +231,7 @@ fn test_route_expired_order_enforces_maker_floor() {
     let order_id = book.place_order(
         &t.maker, &t.token_a, &t.token_b,
         &amount, &min_out, &10_000,
-        &0, &0, &150,
-    );
+        &0, &0, &150, &soroban_sdk::vec![&t.env]);
     t.env.ledger().with_mut(|li| li.sequence_number = 200);
 
     let segments = soroban_sdk::vec![&t.env, seg(1, amount, 0)];
@@ -259,8 +257,7 @@ fn test_route_expired_order_timer_not_reached() {
     let order_id = book.place_order(
         &t.maker, &t.token_a, &t.token_b,
         &amount, &9_999_5000000, &10_000,
-        &0, &0, &150,
-    );
+        &0, &0, &150, &soroban_sdk::vec![&t.env]);
     // Still at ledger 100 — timer hasn't fired
     let segments = soroban_sdk::vec![&t.env, seg(1, amount, 0)];
     assert!(router.try_route_expired_order(&order_id, &segments).is_err());
@@ -284,4 +281,29 @@ fn test_venue_registry() {
     client.remove_venue(&2u32);
     assert!(client.try_get_venue(&2u32).is_err());
     assert_eq!(client.get_venues().len(), 1);
+}
+
+// ─── v1.1: settable fee within compiled cap ──────────────
+
+#[test]
+fn test_router_fee_settable_within_cap() {
+    let t = setup(10_000); // 1:1 venue
+    let client = RouterClient::new(&t.env, &t.router_id);
+    assert_eq!(client.get_fee(), (5, 100_000));
+
+    // Fee holiday: user receives the full venue output
+    client.set_fee(&0);
+    let amount = 10_000_0000000i128;
+    let segments = soroban_sdk::vec![&t.env, seg(1, amount, amount)];
+    let received = client.execute_route(
+        &t.user, &t.token_a, &t.token_b,
+        &amount, &amount, &segments,
+    );
+    assert_eq!(received, amount);
+    assert_eq!(TokenClient::new(&t.env, &t.token_b).balance(&t.fee_vault), 0);
+
+    // Restore; the compiled cap holds
+    client.set_fee(&5);
+    assert!(client.try_set_fee(&6).is_err());
+    assert!(client.try_set_fee(&-1).is_err());
 }

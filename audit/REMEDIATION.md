@@ -7,9 +7,9 @@ item must precede.
 
 | # | Item | Source | Priority | Gate | Status |
 |---|---|---|---|---|---|
-| 1 | Migrate SwapBook oracle to SEP-40 reads (Reflector) — retire the admin-pushed price and its residual key risk | T-ORC-1 | High | Public launch of oracle-priced market orders | Planned; oracle-mode paths remain disabled in the UI until done |
+| 1 | Migrate SwapBook oracle to SEP-40 reads (Reflector) — retire the admin-pushed price and its residual key risk | T-ORC-1 | High | Public launch of oracle-priced market orders | **Implemented in repo (v1.1)** — SEP-40 precedence, fail closed; deploys with v1.1 + Reflector feed config |
 | 2 | Harden the admin key: hardware signer or multisig for the contract-admin account | T-ADM-1..3 | High | TVL growth / public launch | Planned; key currently lives only in the operator's local `stellar` CLI keystore |
-| 3 | `match_and_place` entry point on SwapBook so peer-swap fill+place plans are atomic (today: one tx per step, book can move mid-plan) | T-CH / README gaps | Medium | Public launch | Planned (contract change → new deployment) |
+| 3 | `match_and_place` entry point on SwapBook so peer-swap fill+place plans are atomic (today: one tx per step, book can move mid-plan) | T-CH / README gaps | Medium | Public launch | **Implemented in repo (v1.1)** — awaiting deployment; backend gated on SWAPBOOK_V11 |
 | 4 | GitHub branch protection on `main`: require PR + passing CI, no force-push | T-FE-1 | Medium | Now | Open — one-time repo setting |
 | 5 | Frontend-side independent quote sanity check (cross-check the backend's `min_out` against a second source before signing) | T-BE-1 | Medium | Public launch | Planned |
 | 6 | Event indexer + alerting on admin-surface events (`venue register/remove`, `twap fee`, `fees withdraw`, `admin set`) | T-ADM-2 | Medium | Public launch | Planned — schema exists (`backend/src/db/schema.sql`), writer missing |

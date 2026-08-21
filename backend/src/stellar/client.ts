@@ -281,4 +281,37 @@ export class StellarClient {
       )
     );
   }
+
+  /** Encode Vec<Address> (e.g. place_order's excluded counterparties). */
+  static toAddressVec(addresses: string[]): xdr.ScVal {
+    return xdr.ScVal.scvVec(addresses.map((a) => new Address(a).toScVal()));
+  }
+
+  /**
+   * Encode Vec<FillSpec> for SwapBook.match_and_place. Struct fields
+   * encode as an ScMap with keys in lexicographic order:
+   * amount_out < fill_amount_in < order_id.
+   */
+  static toFillSpecs(
+    fills: Array<{ orderId: number; fillAmountIn: bigint; amountOut: bigint }>
+  ): xdr.ScVal {
+    return xdr.ScVal.scvVec(
+      fills.map((f) =>
+        xdr.ScVal.scvMap([
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol('amount_out'),
+            val: nativeToScVal(f.amountOut, { type: 'i128' }),
+          }),
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol('fill_amount_in'),
+            val: nativeToScVal(f.fillAmountIn, { type: 'i128' }),
+          }),
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol('order_id'),
+            val: nativeToScVal(f.orderId, { type: 'u64' }),
+          }),
+        ])
+      )
+    );
+  }
 }

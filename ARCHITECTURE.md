@@ -21,6 +21,14 @@ transaction in their own wallet; contracts escrow funds and enforce prices
 on-chain. No contract has an upgrade entry point — deployed code is
 immutable; changes require new deployments users opt into.
 
+> **v1.1 note:** the contracts on `main` are one version ahead of the
+> deployed mainnet set — they add `match_and_place` (atomic fill+escrow),
+> per-order excluded counterparties, SEP-40 (Reflector) oracle precedence
+> with the pushed price as fallback for unconfigured pairs, and
+> admin-settable SwapBook/Router fees hard-capped at the deployed
+> 0.5 bps. README §"v1.1" has the details; this document's fee and oracle
+> claims describe the deployed v1.0 behavior until v1.1 ships.
+
 ## System components
 
 ```mermaid

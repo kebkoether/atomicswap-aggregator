@@ -140,18 +140,35 @@ Deploy to testnet: `./scripts/deploy-testnet.sh`.
 | SushiSwap V3 | 2 | pool `slot0` spot | ✅ direct `pool.swap` via adapter (mainnet-verified) |
 | Stellar DEX | 3 | Horizon path-finding (includes classic AMMs) | classic `path_payment` — standalone tx or blend leg, never a Router segment |
 
+## v1.1 (in repo, not yet deployed)
+
+The contracts on `main` are ahead of the deployed mainnet set. New in
+v1.1 — all tested, awaiting deployment + backend `SWAPBOOK_V11=1`:
+
+- **`match_and_place`**: fills reverse-side orders and escrows the
+  remainder in ONE invocation — the book can't move mid-plan.
+- **Excluded counterparties**: per-order list (≤ 5) of addresses that may
+  not fill it; protocol-operated liquidity wallets auto-exclude each
+  other via `SDF_LIQUIDITY_WALLETS`, so seeded inventory can never cross
+  itself. Self-fills are rejected outright.
+- **SEP-40 oracle (Reflector-ready)**: when configured and both tokens of
+  a pair have feeds, prices come exclusively from the SEP-40 oracle (fail
+  closed on stale/missing); other pairs keep the guarded pushed price.
+- **Settable fees, hard-capped**: SwapBook and Router fees are now
+  admin-settable 0–0.5 bps (compile-time cap, like TwapBook's 10 bps) —
+  fee holidays possible, raising above the deployed cap is not.
+- Backend: peer-swap plans prefer organic makers over protocol liquidity
+  wallets, and skip orders that exclude the taker.
+
 ## Known gaps / next up
 
-- **Peer-swap atomicity**: `/api/peer-swap/build` returns one transaction per
-  fill + placement; add a `match_and_place` contract entry point so the book
-  can't move mid-plan.
-- **Reflector migration**: replace the admin-pushed oracle with SEP-40 reads
-  before opening market orders to the public.
+- **Deploy v1.1** (addresses will supersede DEPLOYMENTS.md) and flip
+  `SWAPBOOK_V11=1` + `SWAPBOOK_CONTRACT_ID` on Railway.
 - **Router partner-fee split**: integrator `feeBps` collects on classic legs
   today; Soroban legs need a fee-split entry point in the Router.
 - **Indexer**: the Postgres schema in `backend/src/db/schema.sql` has no
   writer yet — consume the contract events (`order placed/filled/...`).
-- **Audit** before public launch.
+- **Audit** before public launch (of the v1.1 contract set).
 
 ## License
 
