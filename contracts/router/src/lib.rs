@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror,
-    symbol_short, token, Address, Env, IntoVal, Symbol, Vec,
+    symbol_short, token, Address, Env, IntoVal, Symbol, Vec, I256,
 };
 
 /// Protocol fee per 100,000 of total output (rounded up). Admin-settable
@@ -257,7 +257,7 @@ impl Router {
         let fee = Self::calculate_fee(env, total_out);
         let partner_fee = match &partner {
             Some((_, per_100k)) if *per_100k > 0 => {
-                (total_out * per_100k + FEE_DENOMINATOR - 1) / FEE_DENOMINATOR
+                Self::muldiv_ceil(env, total_out, *per_100k, FEE_DENOMINATOR)?
             }
             _ => 0,
         };
@@ -492,7 +492,17 @@ impl Router {
         if amount <= 0 || num == 0 {
             return 0;
         }
-        (amount * num + FEE_DENOMINATOR - 1) / FEE_DENOMINATOR
+        // 256-bit intermediate — parity with SwapBook's fee math
+        Self::muldiv_ceil(env, amount, num, FEE_DENOMINATOR).unwrap_or(i128::MAX)
+    }
+
+    /// ceil(a * b / d) via 256-bit intermediate — no i128 overflow.
+    fn muldiv_ceil(env: &Env, a: i128, b: i128, d: i128) -> Result<i128, RouterError> {
+        let num = I256::from_i128(env, a).mul(&I256::from_i128(env, b));
+        let r = num
+            .add(&I256::from_i128(env, d - 1))
+            .div(&I256::from_i128(env, d));
+        r.to_i128().ok_or(RouterError::InvalidAmount)
     }
 
     fn require_admin(env: &Env) -> Result<(), RouterError> {
