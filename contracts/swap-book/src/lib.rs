@@ -2,12 +2,24 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    symbol_short, token, Address, Env, Vec, I256,
+    symbol_short, token, Address, Env, IntoVal, Symbol, Vec, I256,
 };
 
-/// Protocol fee: 0.5 basis points = 5 per 100,000 (rounded up, min 1 stroop)
-const FEE_NUMERATOR: i128 = 5;
+/// Protocol fee, per 100,000 of the taker's payment (rounded up, min
+/// 1 stroop when nonzero). Admin-settable via set_fee but HARD-CAPPED at
+/// the deployed 0.5 bps — the admin can hold a fee holiday or restore the
+/// rate, never raise it past the cap without a new contract.
+const MAX_FEE_PER_100K: i128 = 5;
+const DEFAULT_FEE_PER_100K: i128 = 5;
 const FEE_DENOMINATOR: i128 = 100_000;
+
+/// Cap on per-order excluded counterparties — bounds the fill-time scan.
+const MAX_EXCLUDED: u32 = 5;
+
+/// SEP-40 feeds report timestamps in seconds or (some deployments)
+/// milliseconds. Anything above this is clearly milliseconds (~5138 AD in
+/// seconds) and gets normalized.
+const SEP40_MS_THRESHOLD: u64 = 100_000_000_000;
 
 /// Basis-point denominator for slippage calculations
 const BPS_DENOMINATOR: i128 = 10_000;
@@ -47,6 +59,15 @@ pub enum DataKey {
     OraclePrice(Address, Address),
     /// Authorized oracle updater address
     OracleAdmin,
+    /// Protocol fee numerator per FEE_DENOMINATOR (settable ≤ cap)
+    FeePer100k,
+    /// SEP-40 oracle contract (e.g. Reflector). When set and both tokens
+    /// of a pair have feeds, it takes precedence over the pushed price.
+    Sep40Oracle,
+    /// Max acceptable age (seconds) of a SEP-40 price
+    Sep40MaxAge,
+    /// SEP-40 asset feed for a token
+    Sep40Feed(Address),
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -73,6 +94,33 @@ pub enum PriceMode {
     /// price and enforces that the taker's payment is within
     /// `max_slippage_bps` of fair value.
     Oracle,
+}
+
+/// Mirror of the SEP-40 `Asset` enum — variant names must match the
+/// oracle contract's exactly (XDR encodes the variant symbol).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum OracleAsset {
+    Stellar(Address),
+    Other(Symbol),
+}
+
+/// Mirror of the SEP-40 `PriceData` struct (field names must match).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Sep40PriceData {
+    pub price: i128,
+    pub timestamp: u64,
+}
+
+/// One fill inside a `match_and_place` plan: take `fill_amount_in` of the
+/// reverse-side order's escrow, paying `amount_out` of its token_out.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FillSpec {
+    pub order_id: u64,
+    pub fill_amount_in: i128,
+    pub amount_out: i128,
 }
 
 /// Oracle price stored as a rational number (numerator / denominator).
@@ -109,6 +157,10 @@ pub struct Order {
     /// Ledger sequence after which the router may claim this order and
     /// execute it through DEX liquidity. 0 = no auto-route (sit forever).
     pub auto_route_after: u32,
+    /// Addresses that may NOT fill this order (≤ MAX_EXCLUDED). Lets a
+    /// liquidity provider running several wallets guarantee on-chain that
+    /// they never cross themselves. Empty = anyone may fill.
+    pub excluded: Vec<Address>,
 }
 
 /// Returned by `claim_expired_timer` so the Router contract can enforce the
@@ -152,6 +204,11 @@ pub enum SwapBookError {
     BookFull = 19,
     OrderNotExpired = 20,
     OracleJumpTooLarge = 21,
+    ExcludedCounterparty = 22,
+    TooManyExclusions = 23,
+    FeeAboveCap = 24,
+    MatchWrongPair = 25,
+    MatchExceedsBudget = 26,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -259,6 +316,8 @@ impl SwapBook {
     /// `max_slippage_bps`: Oracle mode only — must be 1..=MAX_SLIPPAGE_BPS
     /// `auto_route_after`: ledger sequence after which router can claim for DEX.
     ///                     0 = no auto-route (sit on book until expiry).
+    /// `excluded`: addresses that may not fill this order (≤ MAX_EXCLUDED);
+    ///             pass an empty Vec for none.
     pub fn place_order(
         env: Env,
         maker: Address,
@@ -270,9 +329,31 @@ impl SwapBook {
         price_mode: u32,
         max_slippage_bps: u32,
         auto_route_after: u32,
+        excluded: Vec<Address>,
     ) -> Result<u64, SwapBookError> {
         maker.require_auth();
+        Self::place_inner(
+            &env, maker, token_in, token_out, amount_in, min_amount_out,
+            expiry, price_mode, max_slippage_bps, auto_route_after, excluded,
+        )
+    }
 
+    /// Shared placement path — caller must have authenticated `maker`.
+    #[allow(clippy::too_many_arguments)]
+    fn place_inner(
+        env: &Env,
+        maker: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+        expiry: u32,
+        price_mode: u32,
+        max_slippage_bps: u32,
+        auto_route_after: u32,
+        excluded: Vec<Address>,
+    ) -> Result<u64, SwapBookError> {
+        let env = env.clone();
         if amount_in <= 0 {
             return Err(SwapBookError::InvalidAmount);
         }
@@ -308,6 +389,10 @@ impl SwapBook {
         // Validate auto_route_after is in the future (if set)
         if auto_route_after > 0 && auto_route_after <= env.ledger().sequence() {
             return Err(SwapBookError::InvalidAmount);
+        }
+
+        if excluded.len() > MAX_EXCLUDED {
+            return Err(SwapBookError::TooManyExclusions);
         }
 
         // Bound the pair index size before escrowing anything
@@ -349,6 +434,7 @@ impl SwapBook {
             price_mode: mode,
             max_slippage_bps,
             auto_route_after,
+            excluded,
         };
 
         Self::write_order(&env, order_id, &order);
@@ -368,6 +454,135 @@ impl SwapBook {
         );
 
         Ok(order_id)
+    }
+
+    /// Atomically fill reverse-side orders and escrow the remainder as a
+    /// new sitting order — the whole plan lands in ONE invocation, so the
+    /// book cannot move between the fills and the placement.
+    ///
+    /// Each `FillSpec` targets an order selling `token_out` for `token_in`
+    /// (the reverse side of the new order). The maker acts as taker on
+    /// those fills, paying `amount_out` of their token_in per fill. The
+    /// payments plus the escrowed remainder must not exceed `amount_in`.
+    ///
+    /// Returns the new order's id, or 0 if the fills consumed the full
+    /// amount and nothing was placed. Placement params mirror place_order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn match_and_place(
+        env: Env,
+        maker: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+        expiry: u32,
+        price_mode: u32,
+        max_slippage_bps: u32,
+        auto_route_after: u32,
+        excluded: Vec<Address>,
+        fills: Vec<FillSpec>,
+    ) -> Result<u64, SwapBookError> {
+        maker.require_auth();
+
+        if amount_in <= 0 {
+            return Err(SwapBookError::InvalidAmount);
+        }
+
+        let mut spent: i128 = 0;
+        for i in 0..fills.len() {
+            let spec = fills.get(i).unwrap();
+            let order: Order = Self::read_order(&env, spec.order_id)?;
+            // Must be the reverse side of the pair being placed
+            if order.token_in != token_out || order.token_out != token_in {
+                return Err(SwapBookError::MatchWrongPair);
+            }
+            spent += spec.amount_out;
+            if spent > amount_in {
+                return Err(SwapBookError::MatchExceedsBudget);
+            }
+            Self::fill_inner(&env, maker.clone(), order, spec.fill_amount_in, spec.amount_out)?;
+        }
+
+        let remainder = amount_in - spent;
+        if remainder > 0 {
+            let order_id = Self::place_inner(
+                &env, maker, token_in, token_out, remainder, min_amount_out,
+                expiry, price_mode, max_slippage_bps, auto_route_after, excluded,
+            )?;
+            Ok(order_id)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Set the protocol fee (per 100,000 of the taker's payment). Admin
+    /// only, hard-capped at MAX_FEE_PER_100K (0.5 bps) — the ceiling is
+    /// compile-time; 0 is valid (fee holiday).
+    pub fn set_fee(env: Env, fee_per_100k: i128) -> Result<(), SwapBookError> {
+        Self::require_admin(&env)?;
+        if !(0..=MAX_FEE_PER_100K).contains(&fee_per_100k) {
+            return Err(SwapBookError::FeeAboveCap);
+        }
+        env.storage().instance().set(&DataKey::FeePer100k, &fee_per_100k);
+        env.events().publish(
+            (symbol_short!("book"), symbol_short!("fee")),
+            fee_per_100k,
+        );
+        Ok(())
+    }
+
+    /// Current protocol fee as (numerator, denominator).
+    pub fn get_fee(env: Env) -> (i128, i128) {
+        (Self::fee_per_100k(&env), FEE_DENOMINATOR)
+    }
+
+    /// Configure the SEP-40 oracle (e.g. Reflector) and the max price age
+    /// in seconds. Admin only. Once set, pairs where BOTH tokens have a
+    /// registered feed price exclusively off the SEP-40 oracle (fail
+    /// closed); other pairs keep using the pushed price.
+    pub fn set_sep40_oracle(
+        env: Env,
+        oracle: Address,
+        max_age_secs: u64,
+    ) -> Result<(), SwapBookError> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Sep40Oracle, &oracle);
+        env.storage().instance().set(&DataKey::Sep40MaxAge, &max_age_secs);
+        env.events().publish(
+            (symbol_short!("sep40"), symbol_short!("oracle")),
+            (oracle, max_age_secs),
+        );
+        Ok(())
+    }
+
+    /// Register the SEP-40 asset feed for a token. Admin only.
+    pub fn set_sep40_feed(
+        env: Env,
+        token: Address,
+        feed: OracleAsset,
+    ) -> Result<(), SwapBookError> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Sep40Feed(token.clone()), &feed);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Sep40Feed(token.clone()),
+            TTL_THRESHOLD,
+            TTL_EXTEND_TO,
+        );
+        env.events().publish(
+            (symbol_short!("sep40"), symbol_short!("feed")),
+            token,
+        );
+        Ok(())
+    }
+
+    /// Remove a token's SEP-40 feed (pairs including it fall back to the
+    /// pushed price). Admin only.
+    pub fn remove_sep40_feed(env: Env, token: Address) -> Result<(), SwapBookError> {
+        Self::require_admin(&env)?;
+        env.storage().persistent().remove(&DataKey::Sep40Feed(token));
+        Ok(())
     }
 
     /// Cancel an open order. Only the maker can cancel.
@@ -665,15 +880,81 @@ impl SwapBook {
             .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
+    /// Read the price for a directed pair. Precedence: when a SEP-40
+    /// oracle is configured AND both tokens have registered feeds, the
+    /// pair prices exclusively off SEP-40 (fail closed on missing/stale
+    /// data — no silent fallback to the weaker pushed price). Pairs
+    /// without full feed coverage use the pushed price as before.
     fn read_oracle(
         env: &Env,
         token_in: &Address,
         token_out: &Address,
     ) -> Result<OraclePriceData, SwapBookError> {
+        if let Some(oracle) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Sep40Oracle)
+        {
+            let feed_in: Option<OracleAsset> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Sep40Feed(token_in.clone()));
+            let feed_out: Option<OracleAsset> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Sep40Feed(token_out.clone()));
+            if let (Some(feed_in), Some(feed_out)) = (feed_in, feed_out) {
+                let p_in = Self::sep40_lastprice(env, &oracle, feed_in)?;
+                let p_out = Self::sep40_lastprice(env, &oracle, feed_out)?;
+                // Cross rate: both quotes share the oracle's base and
+                // decimals, so they cancel in the ratio.
+                return Ok(OraclePriceData {
+                    num: p_in,
+                    den: p_out,
+                    // Timestamp freshness was just enforced against
+                    // max_age; the ledger-sequence staleness check is
+                    // satisfied by construction for SEP-40 reads.
+                    updated_at: env.ledger().sequence(),
+                });
+            }
+        }
         env.storage()
             .persistent()
             .get(&DataKey::OraclePrice(token_in.clone(), token_out.clone()))
             .ok_or(SwapBookError::OraclePriceNotSet)
+    }
+
+    /// Fetch one SEP-40 lastprice, enforcing positivity and max age.
+    fn sep40_lastprice(
+        env: &Env,
+        oracle: &Address,
+        asset: OracleAsset,
+    ) -> Result<i128, SwapBookError> {
+        let max_age: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Sep40MaxAge)
+            .ok_or(SwapBookError::OraclePriceNotSet)?;
+        let price: Option<Sep40PriceData> = env.invoke_contract(
+            oracle,
+            &Symbol::new(env, "lastprice"),
+            soroban_sdk::vec![env, asset.into_val(env)],
+        );
+        let price = price.ok_or(SwapBookError::OraclePriceNotSet)?;
+        if price.price <= 0 {
+            return Err(SwapBookError::InvalidPrice);
+        }
+        // Normalize feeds that report milliseconds
+        let ts = if price.timestamp > SEP40_MS_THRESHOLD {
+            price.timestamp / 1000
+        } else {
+            price.timestamp
+        };
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(ts) > max_age {
+            return Err(SwapBookError::OraclePriceStale);
+        }
+        Ok(price.price)
     }
 
     fn check_oracle_fresh(env: &Env, price: &OraclePriceData) -> Result<(), SwapBookError> {
@@ -683,19 +964,39 @@ impl SwapBook {
         Ok(())
     }
 
-    /// Shared fill path for full and partial fills.
+    /// Shared fill path for full and partial fills (external entry —
+    /// authenticates the taker, then delegates).
     fn fill_internal(
+        env: &Env,
+        taker: Address,
+        order: Order,
+        fill_amount_in: i128,
+        amount_out: i128,
+    ) -> Result<(), SwapBookError> {
+        taker.require_auth();
+        Self::fill_inner(env, taker, order, fill_amount_in, amount_out)
+    }
+
+    /// Fill path after taker authentication (match_and_place authenticates
+    /// the maker once and calls this directly for each planned fill).
+    fn fill_inner(
         env: &Env,
         taker: Address,
         mut order: Order,
         fill_amount_in: i128,
         amount_out: i128,
     ) -> Result<(), SwapBookError> {
-        taker.require_auth();
         let order_id = order.id;
 
         if order.status != OrderStatus::Open && order.status != OrderStatus::PartialFill {
             return Err(SwapBookError::OrderNotOpen);
+        }
+        if order.excluded.contains(&taker) {
+            return Err(SwapBookError::ExcludedCounterparty);
+        }
+        if taker == order.maker {
+            // Self-fills are pointless and would double-count events
+            return Err(SwapBookError::ExcludedCounterparty);
         }
         if env.ledger().sequence() > order.expiry {
             order.status = OrderStatus::Expired;
@@ -820,9 +1121,17 @@ impl SwapBook {
         Ok((0, 0))
     }
 
-    /// Protocol fee (0.5 bps), rounded up — never zero for a nonzero amount.
+    fn fee_per_100k(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeePer100k)
+            .unwrap_or(DEFAULT_FEE_PER_100K)
+    }
+
+    /// Protocol fee (≤ 0.5 bps, settable), rounded up — never zero for a
+    /// nonzero amount unless the rate itself is zero.
     fn calculate_fee(env: &Env, amount: i128) -> i128 {
-        Self::muldiv_ceil(env, amount, FEE_NUMERATOR, FEE_DENOMINATOR)
+        Self::muldiv_ceil(env, amount, Self::fee_per_100k(env), FEE_DENOMINATOR)
     }
 
     /// floor(a * b / d) via 256-bit intermediate — no i128 overflow.

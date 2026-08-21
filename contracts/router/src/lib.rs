@@ -5,8 +5,10 @@ use soroban_sdk::{
     symbol_short, token, Address, Env, IntoVal, Symbol, Vec,
 };
 
-/// Protocol fee: 0.5 basis points = 5 per 100,000 (rounded up)
-const FEE_NUMERATOR: i128 = 5;
+/// Protocol fee per 100,000 of total output (rounded up). Admin-settable
+/// via set_fee, hard-capped at the deployed 0.5 bps.
+const MAX_FEE_PER_100K: i128 = 5;
+const DEFAULT_FEE_PER_100K: i128 = 5;
 const FEE_DENOMINATOR: i128 = 100_000;
 
 // ─── Storage Keys ───────────────────────────────────────
@@ -21,6 +23,8 @@ pub enum DataKey {
     VenueIds,
     /// Address of the SwapBook contract
     SwapBook,
+    /// Protocol fee numerator per FEE_DENOMINATOR (settable ≤ cap)
+    FeePer100k,
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -63,6 +67,7 @@ pub enum RouterError {
     RouteMismatch = 9,
     SameToken = 10,
     SwapBookNotSet = 11,
+    FeeAboveCap = 12,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -86,6 +91,26 @@ impl Router {
         env.storage()
             .instance()
             .set(&DataKey::VenueIds, &Vec::<u32>::new(&env));
+    }
+
+    /// Set the protocol fee (per 100,000 of total output). Admin only,
+    /// hard-capped at MAX_FEE_PER_100K (0.5 bps); 0 is valid (fee holiday).
+    pub fn set_fee(env: Env, fee_per_100k: i128) -> Result<(), RouterError> {
+        Self::require_admin(&env)?;
+        if !(0..=MAX_FEE_PER_100K).contains(&fee_per_100k) {
+            return Err(RouterError::FeeAboveCap);
+        }
+        env.storage().instance().set(&DataKey::FeePer100k, &fee_per_100k);
+        env.events().publish(
+            (symbol_short!("route"), symbol_short!("fee")),
+            fee_per_100k,
+        );
+        Ok(())
+    }
+
+    /// Current protocol fee as (numerator, denominator).
+    pub fn get_fee(env: Env) -> (i128, i128) {
+        (Self::fee_per_100k(&env), FEE_DENOMINATOR)
     }
 
     /// Register a new DEX venue adapter. Admin only.
@@ -180,7 +205,7 @@ impl Router {
         let total_out = Self::execute_segments(&env, &token_in, &token_out, &segments)?;
 
         // Protocol fee on total output (rounded up)
-        let fee = Self::calculate_fee(total_out);
+        let fee = Self::calculate_fee(&env, total_out);
         let user_receives = total_out - fee;
 
         if user_receives < min_total_out {
@@ -268,7 +293,7 @@ impl Router {
         let total_out =
             Self::execute_segments(&env, &claimed.token_in, &claimed.token_out, &segments)?;
 
-        let fee = Self::calculate_fee(total_out);
+        let fee = Self::calculate_fee(&env, total_out);
         let maker_receives = total_out - fee;
 
         // The maker's own price terms are the floor — never settle below it.
@@ -391,12 +416,20 @@ impl Router {
         Ok(total_out)
     }
 
-    /// Protocol fee (0.5 bps), rounded up.
-    fn calculate_fee(amount: i128) -> i128 {
-        if amount <= 0 {
+    fn fee_per_100k(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeePer100k)
+            .unwrap_or(DEFAULT_FEE_PER_100K)
+    }
+
+    /// Protocol fee (≤ 0.5 bps, settable), rounded up.
+    fn calculate_fee(env: &Env, amount: i128) -> i128 {
+        let num = Self::fee_per_100k(env);
+        if amount <= 0 || num == 0 {
             return 0;
         }
-        (amount * FEE_NUMERATOR + FEE_DENOMINATOR - 1) / FEE_DENOMINATOR
+        (amount * num + FEE_DENOMINATOR - 1) / FEE_DENOMINATOR
     }
 
     fn require_admin(env: &Env) -> Result<(), RouterError> {

@@ -128,7 +128,7 @@ enforcing code.
 
 | ID | Threat | Scenario | Mitigation | Residual risk |
 |---|---|---|---|---|
-| T-ORC-1 | Spoofing/Tampering | Oracle key stolen (Railway breach): push a fake price, then fill victims' oracle-pegged orders at the fake price | Key is a **dedicated** oracle admin (not the contract admin). Per-update jump capped at 20% (`MAX_ORACLE_JUMP_BPS`); prices must be positive; reads stale after ~83 min; user slippage ≤ 10%. Worst-case single-step distortion ≈ 20% + slippage on oracle-mode orders only; fixed-price orders unaffected | **Medium — the top residual risk.** Sustained key control allows 20% steps every update. Planned: migrate to SEP-40 (Reflector) before public market orders; see REMEDIATION |
+| T-ORC-1 | Spoofing/Tampering | Oracle key stolen (Railway breach): push a fake price, then fill victims' oracle-pegged orders at the fake price | Key is a **dedicated** oracle admin (not the contract admin). Per-update jump capped at 20% (`MAX_ORACLE_JUMP_BPS`); prices must be positive; reads stale after ~83 min; user slippage ≤ 10%. Worst-case single-step distortion ≈ 20% + slippage on oracle-mode orders only; fixed-price orders unaffected | **Medium — the top residual risk.** Sustained key control allows 20% steps every update. Mitigation shipped in v1.1 (in repo): SEP-40 oracle precedence with fail-closed staleness — pairs with full feed coverage stop trusting the pushed key entirely. Residual closes when v1.1 deploys with Reflector feeds configured |
 | T-ORC-2 | DoS | Oracle stops updating | Reads fail closed (`OraclePriceStale`) — oracle-mode fills and oracle-bound TWAP slices halt; funds remain cancellable/refundable | Low — availability only |
 
 ### Admin operations (boundary: operator machine → contracts)
