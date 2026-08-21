@@ -12,6 +12,11 @@ interface RoutePreviewProps {
     segments: RouteSegment[];
     amountIn: string;
     blendedBps: number;
+    /** True price impact vs small-size spot rate (unit-safe) */
+    priceImpactBps?: number;
+    /** Symbols attached by SwapWidget for labeling amounts */
+    tokenInSymbol?: string;
+    tokenOutSymbol?: string;
   };
 }
 
@@ -23,10 +28,19 @@ const VENUE_COLORS: Record<string, string> = {
   Curve: '#eab308',
 };
 
+function fmtAmount(raw: string): string {
+  return (parseInt(raw) / 1e7).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
 export default function RoutePreview({ route }: RoutePreviewProps) {
   if (!route.segments || route.segments.length === 0) return null;
 
   const totalIn = parseInt(route.amountIn);
+  const inSym = route.tokenInSymbol ?? '';
+  const outSym = route.tokenOutSymbol ?? '';
 
   return (
     <div
@@ -77,14 +91,13 @@ export default function RoutePreview({ route }: RoutePreviewProps) {
         })}
       </div>
 
-      {/* Segment rows */}
+      {/* Segment rows: venue, share, and in → out amounts in TOKEN units.
+          (Amounts previously carried a hardcoded "$" — 10,000 XLM read as
+          "$10,000". Per-segment effectiveBps was also dropped: it compared
+          token-in units to token-out units, meaningless off stable pairs.) */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
         {route.segments.map((seg, i) => {
           const pct = (parseInt(seg.amountIn) / totalIn) * 100;
-          const displayAmount = (parseInt(seg.amountIn) / 1e7).toLocaleString('en-US', {
-            minimumFractionDigits: 2,
-            maximumFractionDigits: 2,
-          });
           return (
             <div
               key={i}
@@ -110,44 +123,33 @@ export default function RoutePreview({ route }: RoutePreviewProps) {
                   {pct.toFixed(0)}%
                 </span>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                <span style={{ fontSize: '13px', color: '#8a8f9c' }}>${displayAmount}</span>
-                <span
-                  style={{
-                    fontSize: '12px',
-                    fontFamily: 'monospace',
-                    fontWeight: 500,
-                    color:
-                      seg.effectiveBps <= 1
-                        ? '#22c55e'
-                        : seg.effectiveBps <= 5
-                        ? '#eab308'
-                        : '#ef4444',
-                  }}
-                >
-                  {seg.effectiveBps.toFixed(1)} bps
-                </span>
-              </div>
+              <span style={{ fontSize: '13px', color: '#8a8f9c' }}>
+                {fmtAmount(seg.amountIn)}{inSym ? ` ${inSym}` : ''}
+                <span style={{ color: '#565b68' }}> → </span>
+                {fmtAmount(seg.expectedOut)}{outSym ? ` ${outSym}` : ''}
+              </span>
             </div>
           );
         })}
       </div>
 
-      {/* Blended rate footer */}
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          marginTop: '12px',
-          paddingTop: '12px',
-          borderTop: '1px solid #1a1f2e',
-        }}
-      >
-        <span style={{ fontSize: '12px', color: '#565b68' }}>Blended cost</span>
-        <span style={{ fontSize: '13px', fontWeight: 600, color: '#6366f1' }}>
-          {route.blendedBps.toFixed(1)} bps
-        </span>
-      </div>
+      {/* Footer: true price impact (falls back to hiding when unavailable) */}
+      {route.priceImpactBps !== undefined && (
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            marginTop: '12px',
+            paddingTop: '12px',
+            borderTop: '1px solid #1a1f2e',
+          }}
+        >
+          <span style={{ fontSize: '12px', color: '#565b68' }}>Price impact</span>
+          <span style={{ fontSize: '13px', fontWeight: 600, color: '#6366f1' }}>
+            ~{Math.max(0, route.priceImpactBps).toFixed(1)} bps
+          </span>
+        </div>
+      )}
     </div>
   );
 }

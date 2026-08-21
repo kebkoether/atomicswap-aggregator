@@ -513,7 +513,8 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           const baseAmount = Math.floor(parseFloat(amount) * 1e7).toString();
           const data = await fetchQuote(tokenParam(tIn), tokenParam(tOut), baseAmount);
           setQuote(data);
-          onRouteComputed(data);
+          // Symbols ride along so RoutePreview can label amounts correctly
+          onRouteComputed({ ...data, tokenInSymbol: tIn, tokenOutSymbol: tOut });
         } catch (error) {
           console.error('Quote error:', error);
         } finally {
@@ -1191,6 +1192,14 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
               // Protocol fee expressed against the output, in bps.
               const feeBps = outAmt > 0 ? (Number(quote.protocolFee ?? 0) / outAmt) * 10000 : 0;
               const impactBps = Math.max(0, quote.priceImpactBps ?? 0);
+              // Total cost in OUTPUT-TOKEN units — concrete beats abstract.
+              // $-prefixed only when the output token is a USD stable.
+              const totalBps = impactBps + feeBps;
+              const costUnits = (totalBps / 10000) * (outAmt / 1e7);
+              const isUsdStable = ['USDC', 'PYUSD', 'USDT0', 'USDY'].includes(tokenOut);
+              const costStr = costUnits > 0
+                ? `≈ ${isUsdStable ? '$' : ''}${costUnits.toLocaleString('en-US', { maximumFractionDigits: costUnits < 1 ? 4 : 2 })}${isUsdStable ? '' : ' ' + tokenOut} (${totalBps.toFixed(1)} bps)`
+                : `${totalBps.toFixed(1)} bps`;
               return [
                 { label: 'Rate', value: rateStr },
                 {
@@ -1201,7 +1210,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                   color: parseInt(quote.swapBookAmountOut ?? '0') > 0 ? '#22c55e' : '#8a8f9c',
                 },
                 { label: 'Price impact', value: `~${impactBps.toFixed(1)} bps`, color: '#eab308' },
-                { label: 'Total cost', value: `${(impactBps + feeBps).toFixed(1)} bps`, color: '#6366f1', bold: true },
+                { label: 'Total cost', value: costStr, color: '#6366f1', bold: true },
               ];
             })().map((row: any) => (
               <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', padding: '3px 0' }}>
