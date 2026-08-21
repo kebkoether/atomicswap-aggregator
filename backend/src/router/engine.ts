@@ -40,8 +40,13 @@ export interface Route {
   tokenOut: string;
   totalAmountIn: bigint;
   totalExpectedOut: bigint;
-  /** Blended effective cost in basis points (includes all fees) */
+  /** DEPRECATED for display: (amountIn − amountOut)/amountIn across
+   *  different token units — only meaningful for 1:1-pegged pairs.
+   *  For XLM→USDC this reads ~8150 "bps" of pure exchange rate. */
   blendedBps: number;
+  /** True price impact in bps: execution rate vs the best small-size
+   *  ("spot") rate across venues. Unit-safe for any pair. */
+  priceImpactBps: number;
   /** Protocol fee (0.5 bps) — only charged on the SwapBook P2P portion */
   protocolFee: bigint;
   /** How much of the output came from our SwapBook (P2P) */
@@ -161,6 +166,23 @@ export class RoutingEngine {
         ? Number(((amountIn - netAmountOut) * 10000n) / amountIn)
         : 0;
 
+    // True price impact: execution rate vs the best small-size rate any
+    // venue offers (the effective "spot"). Small residual noise from
+    // ladder interpolation is clamped at 0.
+    let spotRate = 0;
+    for (const prof of profiles) {
+      const q = prof.quotes[0];
+      if (q && q.amountOut > 0n && q.amountIn > 0n) {
+        const r = Number(q.amountOut) / Number(q.amountIn);
+        if (r > spotRate) spotRate = r;
+      }
+    }
+    const execRate = amountIn > 0n ? Number(totalExpectedOut) / Number(amountIn) : 0;
+    const priceImpactBps =
+      spotRate > 0 && execRate > 0
+        ? Math.max(0, (1 - execRate / spotRate) * 10_000)
+        : 0;
+
     // 5. Build on-chain swap instructions
     const instructions = await Promise.all(
       segments.map(async (seg) => {
@@ -185,6 +207,7 @@ export class RoutingEngine {
       totalAmountIn: amountIn,
       totalExpectedOut,
       blendedBps,
+      priceImpactBps,
       protocolFee,
       swapBookAmountOut: swapBookOut,
       netAmountOut,

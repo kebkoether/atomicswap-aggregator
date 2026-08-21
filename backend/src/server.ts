@@ -517,6 +517,7 @@ app.get('/api/quote', async (req, res) => {
       protocolFee: route.protocolFee.toString(),
       swapBookAmountOut: route.swapBookAmountOut.toString(),
       blendedBps: route.blendedBps,
+      priceImpactBps: route.priceImpactBps,
       segments: route.segments.map((s) => ({
         venue: s.venueName,
         venueId: s.venueId,
