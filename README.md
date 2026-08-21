@@ -27,8 +27,9 @@ partner fee economics — see [INTEGRATORS.md](./INTEGRATORS.md) or
 [ufama.trade/docs](https://ufama.trade/docs). Keys: hello@ufama.trade.
 
 Mainnet contract addresses: [DEPLOYMENTS.md](./DEPLOYMENTS.md).
-Original design doc: [ARCHITECTURE.md](./ARCHITECTURE.md) — where they
-disagree, **the contracts are the source of truth**.
+Architecture: [ARCHITECTURE.md](./ARCHITECTURE.md) ·
+Threat model & dataflow diagram: [THREAT_MODEL.md](./THREAT_MODEL.md) ·
+Keys & disclosure policy: [SECURITY.md](./SECURITY.md).
 
 ## Repo layout
 
@@ -144,6 +145,10 @@ Deploy to testnet: `./scripts/deploy-testnet.sh`.
   writer yet — consume the contract events (`order placed/filled/...`).
 - **Audit** before public launch.
 
+## License
+
+[Apache-2.0](./LICENSE).
+
 ## Contact
 
-hello@ufama.trade
+hello@ufama.trade — security reports: see [SECURITY.md](./SECURITY.md).
