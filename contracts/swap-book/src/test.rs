@@ -10,6 +10,7 @@ use soroban_sdk::{
 struct TestCtx {
     env: Env,
     contract_id: Address,
+    #[allow(dead_code)]
     admin: Address,
     fee_vault: Address,
     token_a: Address,

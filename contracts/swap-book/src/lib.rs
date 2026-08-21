@@ -323,7 +323,7 @@ impl SwapBook {
 
         // Transfer token_in from maker to this contract (escrow)
         let token_client = token::Client::new(&env, &token_in);
-        token_client.transfer(&maker, &env.current_contract_address(), &amount_in);
+        token_client.transfer(&maker, env.current_contract_address(), &amount_in);
 
         // Generate order ID
         let order_id: u64 = env

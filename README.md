@@ -43,6 +43,9 @@ contracts/            Soroban contracts (Rust, soroban-sdk 27)
   adapters/aqua/      Aquarius adapter (swap_chained, invoker-auth pattern)
   adapters/sushiswap/ SushiSwap V3 adapter (direct pool.swap — their router is
                       not callable from contracts)
+  integration-tests/  Cross-contract E2E suite: real FeeVault + SwapBook +
+                      Router + TwapBook wired together, full lifecycles
+                      (escrow → execution → fee accrual → admin withdrawal)
 backend/              Express + @stellar/stellar-sdk: quotes, split routing,
                       tx building, TWAP keeper, timer sweep, oracle pusher,
                       integrator API (/v1)
@@ -94,13 +97,18 @@ P2P-book-first fills.
 
 ## Development
 
-Contracts (Rust 1.85+, `wasm32v1-none` target):
+Contracts (toolchain pinned in `contracts/rust-toolchain.toml`,
+`wasm32v1-none` target):
 
 ```bash
 cd contracts
-cargo test
+cargo test        # unit tests + cross-contract integration tests
+cargo clippy --all-targets -- -D warnings -A clippy::too-many-arguments -A clippy::inconsistent-digit-grouping -A deprecated
 cargo build --release --target wasm32v1-none
 ```
+
+CI runs all three plus `cargo audit` and both typechecks on every PR.
+Security tooling reports live in [audit/](./audit/).
 
 Backend:
 
