@@ -1,0 +1,22 @@
+# Ufama — SEP-1 stellar.toml
+# https://ufama.trade
+
+VERSION = "2.7.0"
+NETWORK_PASSPHRASE = "Public Global Stellar Network ; September 2015"
+
+ACCOUNTS = [
+  "GB3BIN23PHTOPHTEGTC4VCY2HVSY6HDYG3C6QXQQ3TCEJR74K6DWGMQT"
+]
+
+[DOCUMENTATION]
+ORG_NAME = "Ufama"
+ORG_URL = "https://ufama.trade"
+ORG_DESCRIPTION = "Ufama is a swap protocol on Stellar: peer-to-peer order matching at 0.5 bps, smart order routing across Aqua, SushiSwap, the Stellar DEX and classic AMMs (with automatic split execution when it improves the price), and on-chain TWAP execution with contract-enforced pacing. Non-custodial: users sign every transaction in their own wallet; contracts escrow and enforce prices on-chain."
+ORG_OFFICIAL_EMAIL = "hello@ufama.trade"
+ORG_SUPPORT_EMAIL = "hello@ufama.trade"
+
+# Deployed Soroban contracts (mainnet):
+#   SwapBook (P2P orderbook)  CBPTU2MADELJOEPJWJIJUYXM36YFKQYMECNDIW6SFLZZ3XKABGZ44SVF
+#   Router (route execution)  CD4EKANBDBF5NNV6BNJVPIHGZLLUKEXBB3QXZ3QWPOX5LNCEFPOJ2J6I
+#   TwapBook (TWAP orders)    CCOFNUDEHVPZQSDLENYA6DGX3UTQQVYTUMG5ZBEYFIMNA4C3IQLPTONJ
+#   FeeVault                  CAIBVO2HVR77N6ZMUNFG23ORBONCJGKN7WSBYSMSDUFYTC43YJVASOWI

@@ -15,6 +15,8 @@ import { createContext, useContext, useState, useCallback, useEffect, ReactNode 
 const EXPECTED_PASSPHRASE =
   process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE ?? 'Test SDF Network ; September 2015';
 
+// NOTE: key intentionally keeps the legacy name — renaming it would silently
+// disconnect every existing user's wallet session on the rebrand deploy.
 const STORAGE_KEY = 'atomicswap.wallet'; // { walletId, address }
 
 let kitReady = false;

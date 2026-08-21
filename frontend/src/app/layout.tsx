@@ -4,9 +4,9 @@ import Providers from '@/components/Providers';
 import Header from '@/components/Header';
 
 export const metadata: Metadata = {
-  title: 'AtomicSwap — Smart Swap Aggregator on Stellar',
+  title: 'Ufama — Smart Swap Aggregator on Stellar',
   description:
-    'Peer-to-peer atomic swaps with smart DEX routing. The cheapest way to swap on Stellar.',
+    'Peer-to-peer swaps, TWAP execution, and smart DEX routing. The cheapest way to swap on Stellar.',
 };
 
 export default function RootLayout({

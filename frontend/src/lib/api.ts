@@ -1,5 +1,5 @@
 /**
- * Backend API client for the AtomicSwap Aggregator.
+ * Backend API client for Ufama (formerly AtomicSwap Aggregator).
  */
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
