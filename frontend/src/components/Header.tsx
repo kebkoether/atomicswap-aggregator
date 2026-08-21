@@ -66,7 +66,7 @@ export default function Header() {
               letterSpacing: '-1px',
             }}
           >
-            A
+            U
           </div>
           <span
             style={{
@@ -76,7 +76,7 @@ export default function Header() {
               letterSpacing: '-0.3px',
             }}
           >
-            AtomicSwap
+            Ufama
           </span>
           <span
             style={{
@@ -106,6 +106,12 @@ export default function Header() {
             style={{ fontSize: '14px', fontWeight: 500, color: '#8a8f9c', textDecoration: 'none' }}
           >
             Orders
+          </a>
+          <a
+            href="/docs"
+            style={{ fontSize: '14px', fontWeight: 500, color: '#8a8f9c', textDecoration: 'none' }}
+          >
+            Docs
           </a>
 
           {connected && address ? (

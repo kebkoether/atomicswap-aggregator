@@ -1,14 +1,34 @@
-# AtomicSwap Aggregator
+# Ufama
 
-Peer-to-peer swap protocol + DEX aggregator on Stellar (Soroban). Users sit
-limit orders on an on-chain orderbook (SwapBook) and match peer-to-peer at
-0.5 bps; impatient flow gets smart-routed across DEX venues (Aqua, SDEX,
-SushiSwap-on-Stellar pending ABI verification) by an off-chain routing
-engine, executed atomically by the on-chain Router.
+**Live at [ufama.trade](https://ufama.trade)** · formerly "AtomicSwap Aggregator"
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for the original design document.
-Where the two disagree, **the contracts are the source of truth** — the
-protocol was security-hardened in Aug 2026 and several interfaces changed.
+Swap protocol on Stellar (Soroban), three execution styles in one UI:
+
+- **Instant swap** — smart order routing across Aqua, SushiSwap-on-Stellar,
+  the Stellar DEX and classic AMMs. The router builds a marginal price
+  curve per venue and splits big orders at the exact crossover points;
+  when blending the SDEX book with AMMs beats any single route by more
+  than the fee-aware gate, it automatically returns a two-transaction
+  split plan (each leg min-out protected). Protocol fee: 0.5 bps.
+- **P2P match** — sit a limit order on the on-chain SwapBook and match
+  peer-to-peer at 0.5 bps, with an optional auto-route timer: if nobody
+  fills you in N minutes, a permissionless keeper routes the escrow
+  through the DEXes, your price floor enforced on-chain.
+- **TWAP** — escrow a total and a schedule; a permissionless keeper
+  executes slices with contract-enforced pace, price, and cadence.
+  Fee: 10 bps, admin-settable but hard-capped on-chain at 10 bps.
+
+Non-custodial throughout: users sign every transaction in their own
+wallet (Freighter, xBull, LOBSTR, Albedo, Hana, Rabet via Stellar
+Wallets Kit); contracts escrow funds and enforce prices on-chain.
+
+**Integrators:** REST API (quote → build → your user signs → send) with
+partner fee economics — see [INTEGRATORS.md](./INTEGRATORS.md) or
+[ufama.trade/docs](https://ufama.trade/docs). Keys: hello@ufama.trade.
+
+Mainnet contract addresses: [DEPLOYMENTS.md](./DEPLOYMENTS.md).
+Original design doc: [ARCHITECTURE.md](./ARCHITECTURE.md) — where they
+disagree, **the contracts are the source of truth**.
 
 ## Repo layout
 
@@ -17,13 +37,16 @@ contracts/            Soroban contracts (Rust, soroban-sdk 27)
   swap-book/          On-chain orderbook: escrow, fills, oracle pricing, timers
   router/             Multi-venue route execution + permissionless keeper entry
   twap-book/          TWAP orders: escrowed schedules, keeper-run slices with
-                      on-chain pace/price/cadence enforcement
+                      on-chain pace/price/cadence enforcement (settable fee,
+                      hard-capped 10 bps)
   fee-vault/          Protocol fee custody (balance-based, no shadow accounting)
-  adapters/aqua/      Aquarius adapter (real swap_chained ABI, pool registry)
-  adapters/sushiswap/ ⚠️ placeholder ABI — do not deploy/register yet
-backend/              Express + @stellar/stellar-sdk: quotes, routing, tx building,
-                      keeper sweep, oracle price pusher
-frontend/             Next.js + Freighter (v6 API), network-guarded signing
+  adapters/aqua/      Aquarius adapter (swap_chained, invoker-auth pattern)
+  adapters/sushiswap/ SushiSwap V3 adapter (direct pool.swap — their router is
+                      not callable from contracts)
+backend/              Express + @stellar/stellar-sdk: quotes, split routing,
+                      tx building, TWAP keeper, timer sweep, oracle pusher,
+                      integrator API (/v1)
+frontend/             Next.js + Stellar Wallets Kit, network-guarded signing
 scripts/              Testnet deployment
 ```
 
@@ -40,12 +63,15 @@ scripts/              Testnet deployment
 - **Oracle hardening.** Oracle-pegged orders use an admin-pushed price that
   must be positive, fresh (< ~83 min), and within 20% of the previous price
   per update — bounding the damage of a compromised oracle key. Slippage
-  tolerance is capped at 10%. For mainnet, migrate to a SEP-40 oracle
-  (e.g. Reflector) instead of the CoinGecko pusher.
+  tolerance is capped at 10%. Before public launch, migrate to a SEP-40
+  oracle (e.g. Reflector) instead of the pusher.
 - **Constructors, not initializers.** All contracts take their admin via
   `__constructor` at deploy time — no init front-running window.
 - **FeeVault balances are token balances.** Withdrawals check the actual
   token balance; there is no shadow accounting to drift or strand fees.
+- **TWAP fee ceiling is compile-time.** `set_fee` can lower or restore the
+  rate within `MAX_FEE_PER_100K` (10 bps) but can never exceed it without
+  deploying a new contract makers would have to opt into.
 
 ## TWAP orders
 
@@ -58,11 +84,13 @@ the Router. The contract — never the keeper — enforces:
   or a fresh SwapBook oracle price ± slippage when no limit is set
 - **Cadence**: a minimum ledger gap between slices
 
-Proceeds stream to the maker every slice (net of the 0.5 bps fee). Cancel
-refunds the remainder instantly; anyone can `expire_twap` a lapsed order
-to trigger the refund. A malfunctioning keeper can only slow execution
-down — never fill at a worse price. v2 roadmap: volume-adaptive slice
-sizing (participation caps vs live venue volume) and P2P-book-first fills.
+Proceeds stream to the maker every slice (net of the fee). The keeper
+tracks the pro-rata line mid-flight and enters an end-game mode near the
+window close so orders complete in full (verified live: 100% fill).
+Cancel refunds the remainder instantly; anyone can `expire_twap` a lapsed
+order. A malfunctioning keeper can only slow execution down — never fill
+at a worse price. v2 roadmap: volume-adaptive slice sizing and
+P2P-book-first fills.
 
 ## Development
 
@@ -70,8 +98,8 @@ Contracts (Rust 1.85+, `wasm32v1-none` target):
 
 ```bash
 cd contracts
-cargo test                                   # 28 tests
-cargo build --release --target wasm32v1-none # deployable wasm
+cargo test
+cargo build --release --target wasm32v1-none
 ```
 
 Backend:
@@ -92,31 +120,30 @@ npm install
 npm run dev            # http://localhost:3000
 ```
 
-Deploy to testnet: `./scripts/deploy-testnet.sh` (deploys FeeVault, SwapBook,
-Aqua adapter, Router; wires `set_router`/`set_oracle_admin`; registers Aqua
-as venue 1).
+Deploy to testnet: `./scripts/deploy-testnet.sh`.
 
 ## Venue status
 
 | Venue | ID | Quotes | On-chain execution |
 |---|---|---|---|
-| SwapBook (P2P) | 0 | `quote_fill` (taker-direction) | fill/partial_fill ops via peer-swap flow |
-| Aqua | 1 | Aqua REST + pool `estimate_swap` | ✅ `swap_chained` via adapter (register pools with `set_pool`) |
-| SushiSwap | 2 | ❌ placeholder | ❌ ABI unverified — do not register |
-| Stellar DEX | 3 | Horizon path-finding (includes classic AMMs) | classic `path_payment` ops only — never in Router segments |
+| SwapBook (P2P) | 0 | `quote_fill` (taker-direction) | fill/partial_fill via peer-swap flow |
+| Aqua | 1 | Aqua REST + pool `estimate_swap` | ✅ `swap_chained` via adapter (mainnet-verified) |
+| SushiSwap V3 | 2 | pool `slot0` spot | ✅ direct `pool.swap` via adapter (mainnet-verified) |
+| Stellar DEX | 3 | Horizon path-finding (includes classic AMMs) | classic `path_payment` — standalone tx or blend leg, never a Router segment |
 
 ## Known gaps / next up
 
-- **Aqua allowance pattern**: the adapter approves the Aqua router and calls
-  `swap_chained`; verify on testnet whether Aqua pulls via allowance or needs
-  `authorize_as_current_contract`, and adjust.
-- **SushiSwap adapter**: confirm their Soroban router ABI + addresses, then
-  replace the placeholder function names.
 - **Peer-swap atomicity**: `/api/peer-swap/build` returns one transaction per
-  fill + placement; collapse into a single multi-op transaction (or a
-  `match_and_place` contract entry point) so the book can't move mid-plan.
-- **SAC addresses**: populate `backend/src/stellar/tokens.ts` (USDC/PYUSD/
-  USDY) via `stellar contract id asset`.
+  fill + placement; add a `match_and_place` contract entry point so the book
+  can't move mid-plan.
+- **Reflector migration**: replace the admin-pushed oracle with SEP-40 reads
+  before opening market orders to the public.
+- **Router partner-fee split**: integrator `feeBps` collects on classic legs
+  today; Soroban legs need a fee-split entry point in the Router.
 - **Indexer**: the Postgres schema in `backend/src/db/schema.sql` has no
   writer yet — consume the contract events (`order placed/filled/...`).
-- **Audit** before mainnet.
+- **Audit** before public launch.
+
+## Contact
+
+hello@ufama.trade

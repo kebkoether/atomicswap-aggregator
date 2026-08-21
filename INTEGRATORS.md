@@ -1,4 +1,4 @@
-# Integrator API (v1)
+# Ufama Integrator API (v1)
 
 REST API for wallets and payment apps that want to offer swaps on Stellar
 without running their own routing. Same shape as the Soroswap API, so if
@@ -17,7 +17,7 @@ x-api-key: ak_live_...
 Authorization: Bearer ak_live_...
 ```
 
-Keys are issued manually for now — contact us. Rate limit: 120
+Keys are issued manually for now — email hello@ufama.trade. Rate limit: 120
 requests/min per key (429 with `retryAfterSeconds` beyond that).
 
 ## Partner fees
