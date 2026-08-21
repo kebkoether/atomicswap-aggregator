@@ -22,6 +22,7 @@ import { StellarClient, scEnum } from './stellar/client.js';
 import { TOKENS, resolveToken, resolveSacAddress } from './stellar/tokens.js';
 import { OraclePriceService } from './services/oracle.js';
 import { TimerSweepService } from './services/timer-sweep.js';
+import { assertNotBlocked, isBlocked, BlockedAddressError } from './services/screening.js';
 import { TokenDiscoveryService } from './services/token-discovery.js';
 import { TwapKeeperService } from './services/twap-keeper.js';
 
@@ -153,6 +154,10 @@ function resolveTokenParam(value: unknown, field: string): string {
 function handleError(res: express.Response, error: unknown, label: string): void {
   if (error instanceof BadRequest) {
     res.status(400).json({ error: error.message });
+    return;
+  }
+  if (error instanceof BlockedAddressError) {
+    res.status(403).json({ error: error.message });
     return;
   }
   console.error(`${label}:`, error);
@@ -669,6 +674,7 @@ app.post('/api/orders/cancel', async (req, res) => {
 app.post('/api/swap/build', async (req, res) => {
   try {
     const sourceAddress = parseStellarAccount(req.body.sourceAddress, 'sourceAddress');
+    await assertNotBlocked(sourceAddress);
     const tokenIn = resolveTokenParam(req.body.tokenIn, 'tokenIn');
     const tokenOut = resolveTokenParam(req.body.tokenOut, 'tokenOut');
     const amountIn = parseAmount(req.body.amountIn, 'amountIn');
@@ -821,6 +827,7 @@ app.post('/api/swap/build', async (req, res) => {
 app.post('/api/peer-swap/build', async (req, res) => {
   try {
     const sourceAddress = parseStellarAccount(req.body.sourceAddress, 'sourceAddress');
+    await assertNotBlocked(sourceAddress);
     assertP2pAllowed(req.body.tokenIn, 'tokenIn');
     assertP2pAllowed(req.body.tokenOut, 'tokenOut');
     const tokenIn = resolveTokenParam(req.body.tokenIn, 'tokenIn');
@@ -1088,6 +1095,7 @@ app.post('/api/twap/build', async (req, res) => {
   try {
     if (!config.twapBookContractId) throw new BadRequest('TWAP not deployed');
     const sourceAddress = parseStellarAccount(req.body.sourceAddress, 'sourceAddress');
+    await assertNotBlocked(sourceAddress);
     const tokenIn = resolveTokenParam(req.body.tokenIn, 'tokenIn');
     const tokenOut = resolveTokenParam(req.body.tokenOut, 'tokenOut');
     const amountIn = parseAmount(req.body.amountIn, 'amountIn');
@@ -1319,6 +1327,20 @@ app.get('/api/oracle/price', (req, res) => {
 /**
  * GET /api/health
  */
+/**
+ * GET /api/screen/:address — connect-time compliance check for the UI.
+ * Returns { allowed } so the frontend can refuse flagged wallets before
+ * any quote is shown. Build endpoints enforce the same check server-side.
+ */
+app.get('/api/screen/:address', async (req, res) => {
+  try {
+    const address = parseStellarAccount(req.params.address, 'address');
+    res.json({ allowed: !(await isBlocked(address)) });
+  } catch (error) {
+    handleError(res, error, 'Failed to screen address');
+  }
+});
+
 app.get('/api/health', async (_req, res) => {
   const venues = await registry.getAvailable();
   res.json({
@@ -1450,7 +1472,7 @@ app.post('/v1/quote', v1Auth, async (req, res) => {
       amountIn: amount.toString(),
       amountOut: netOut.toString(),
       partnerFee: partnerFee.toString(),
-      partnerFeeCollected: kind === 'classic' || feeBps === 0,
+      partnerFeeCollected: kind === 'classic' || feeBps === 0 || config.swapbookV11,
       minAmountOut: ((netOut * BigInt(10000 - slippage)) / 10000n).toString(),
       kind,
       segments:
@@ -1477,6 +1499,7 @@ app.post('/v1/quote', v1Auth, async (req, res) => {
 app.post('/v1/quote/build', v1Auth, async (req, res) => {
   try {
     const from = parseStellarAccount(req.body.from, 'from');
+    await assertNotBlocked(from);
     const assetIn = resolveTokenParam(req.body.assetIn, 'assetIn');
     const assetOut = resolveTokenParam(req.body.assetOut, 'assetOut');
     const amount = parseAmount(req.body.amount, 'amount');
@@ -1506,28 +1529,46 @@ app.post('/v1/quote/build', v1Auth, async (req, res) => {
     if (!route || route.instructions.length === 0) {
       throw new BadRequest('No executable venue liquidity for this pair');
     }
-    const minTotalOut = (route.netAmountOut * BigInt(10000 - slippage)) / 10000n;
+    // v1.1 Router: partner fee carved on-chain via execute_route_partner
+    // (additive — on top of the protocol fee, never out of it). Requires
+    // SWAPBOOK_V11; against the v1.0 Router the fee is skipped as before.
+    const usePartnerSplit =
+      config.swapbookV11 && feeBps > 0 && referralAddress !== null;
+    const partnerFeeEstimate = usePartnerSplit
+      ? muldivCeil(route.netAmountOut, BigInt(feeBps * 10), 100_000n)
+      : 0n;
+    const netAfterPartner = route.netAmountOut - partnerFeeEstimate;
+    const minTotalOut = (netAfterPartner * BigInt(10000 - slippage)) / 10000n;
     if (minTotalOut <= 0n) throw new BadRequest('Route output too small');
-    const xdr = await stellar.buildTransaction(from, config.routerContractId, 'execute_route', [
+    const segArgs = StellarClient.toRouteSegments(
+      route.instructions.map((i) => ({
+        venueId: i.venueId,
+        amountIn: i.amountIn,
+        minAmountOut: i.minAmountOut,
+      }))
+    );
+    const baseArgs = [
       StellarClient.toAddress(from),
       StellarClient.toAddress(assetIn),
       StellarClient.toAddress(assetOut),
       StellarClient.toI128(route.totalAmountIn),
       StellarClient.toI128(minTotalOut),
-      StellarClient.toRouteSegments(
-        route.instructions.map((i) => ({
-          venueId: i.venueId,
-          amountIn: i.amountIn,
-          minAmountOut: i.minAmountOut,
-        }))
-      ),
-    ]);
+      segArgs,
+    ];
+    const xdr = usePartnerSplit
+      ? await stellar.buildTransaction(from, config.routerContractId, 'execute_route_partner', [
+          ...baseArgs,
+          StellarClient.toAddress(referralAddress as string),
+          // Contract takes per-100k (0.1 bp granularity): bps * 10
+          StellarClient.toI128(BigInt(feeBps * 10)),
+        ])
+      : await stellar.buildTransaction(from, config.routerContractId, 'execute_route', baseArgs);
     res.json({
       xdr,
       kind,
-      partnerFee: '0',
-      partnerFeeCollected: false, // Soroban fee-split lands with Router v2
-      expectedOut: route.netAmountOut.toString(),
+      partnerFee: partnerFeeEstimate.toString(),
+      partnerFeeCollected: usePartnerSplit,
+      expectedOut: netAfterPartner.toString(),
     });
   } catch (error) {
     handleError(res, error, 'Failed to build transaction');

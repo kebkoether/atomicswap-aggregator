@@ -491,12 +491,19 @@ impl SwapBook {
         let mut spent: i128 = 0;
         for i in 0..fills.len() {
             let spec = fills.get(i).unwrap();
+            // Validate amounts BEFORE budget accounting — a negative
+            // amount_out must never be able to shrink `spent`.
+            if spec.fill_amount_in <= 0 || spec.amount_out <= 0 {
+                return Err(SwapBookError::InvalidAmount);
+            }
             let order: Order = Self::read_order(&env, spec.order_id)?;
             // Must be the reverse side of the pair being placed
             if order.token_in != token_out || order.token_out != token_in {
                 return Err(SwapBookError::MatchWrongPair);
             }
-            spent += spec.amount_out;
+            spent = spent
+                .checked_add(spec.amount_out)
+                .ok_or(SwapBookError::Overflow)?;
             if spent > amount_in {
                 return Err(SwapBookError::MatchExceedsBudget);
             }

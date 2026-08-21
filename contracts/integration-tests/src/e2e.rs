@@ -107,6 +107,9 @@ fn deploy_world(venue_rate_bps: i128) -> World {
     StellarAssetClient::new(&env, &token_b).mint(&venue, &10_000_000_0000000);
     RouterClient::new(&env, &router_id).register_venue(&1u32, &venue);
     TwapBookClient::new(&env, &twap_id).register_venue(&1u32, &venue);
+    // v1.1 defaults the Router fee to 0; these lifecycles verify the fee
+    // plumbing at the historical 0.5 bps rate.
+    RouterClient::new(&env, &router_id).set_fee(&5);
 
     World {
         env,
