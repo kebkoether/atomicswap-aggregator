@@ -5,7 +5,7 @@
 import { VenueAdapter } from './adapter.js';
 import { SwapBookAdapter } from './swapbook.js';
 import { AquaAdapter } from './aqua.js';
-import { SushiSwapAdapter } from './sushiswap.js';
+import { SushiSwapAdapter, SushiPairsProvider } from './sushiswap.js';
 import { StellarDexAdapter } from './stellar-dex.js';
 import { StellarClient } from '../stellar/client.js';
 
@@ -42,6 +42,8 @@ export function createVenueRegistry(config: {
   horizonUrl: string;
   rpcUrl: string;
   networkPassphrase: string;
+  /** Live Sushi pair source (token discovery); env SUSHI_PAIRS overrides */
+  sushiPairsProvider?: SushiPairsProvider;
 }): VenueRegistry {
   const registry = new VenueRegistry();
 
@@ -63,7 +65,12 @@ export function createVenueRegistry(config: {
 
   if (config.sushiAdapterContractId) {
     registry.register(
-      new SushiSwapAdapter(config.sushiAdapterContractId, stellar, process.env.SUSHI_PAIRS)
+      new SushiSwapAdapter(
+        config.sushiAdapterContractId,
+        stellar,
+        process.env.SUSHI_PAIRS,
+        config.sushiPairsProvider
+      )
     );
   }
 

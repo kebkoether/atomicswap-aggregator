@@ -183,6 +183,19 @@ const stellar = new StellarClient({
   networkPassphrase: config.networkPassphrase,
 });
 
+// Token discovery must exist before the venue registry so the Sushi
+// adapter can read its live pair table.
+const tokenDiscovery = new TokenDiscoveryService({
+  aquaApiUrl: config.aquaApiUrl,
+  sushiGraphqlUrl:
+    process.env.SUSHI_GRAPHQL_URL ??
+    'https://production.data-gcp.sushi.com/api/graphql',
+  intervalMs: 10 * 60 * 1000, // 10 minutes
+  minTxCount: parseInt(process.env.DISCOVERY_MIN_TX_COUNT ?? '10'),
+  minSushiLiquidityUsd: parseInt(process.env.SUSHI_MIN_LIQUIDITY_USD ?? '500'),
+});
+tokenDiscovery.start();
+
 console.log('Registering venues:');
 const registry = createVenueRegistry({
   swapbookContractId: config.swapbookContractId,
@@ -192,6 +205,7 @@ const registry = createVenueRegistry({
   horizonUrl: config.horizonUrl,
   rpcUrl: config.rpcUrl,
   networkPassphrase: config.networkPassphrase,
+  sushiPairsProvider: () => tokenDiscovery.getSushiPairs(),
 });
 console.log('');
 
@@ -206,13 +220,6 @@ const oracleService = new OraclePriceService({
   oracleSecretKey: process.env.ORACLE_SECRET_KEY,
 });
 oracleService.start();
-
-const tokenDiscovery = new TokenDiscoveryService({
-  aquaApiUrl: config.aquaApiUrl,
-  intervalMs: 10 * 60 * 1000, // 10 minutes
-  minTxCount: parseInt(process.env.DISCOVERY_MIN_TX_COUNT ?? '10'),
-});
-tokenDiscovery.start();
 
 const timerSweep = new TimerSweepService({
   stellar,
