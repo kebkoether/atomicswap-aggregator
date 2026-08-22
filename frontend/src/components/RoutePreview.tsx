@@ -37,7 +37,12 @@ function fmtAmount(raw: string, decimals: number): string {
 }
 
 export default function RoutePreview({ route }: RoutePreviewProps) {
-  if (!route.segments || route.segments.length === 0) return null;
+  // A venue that contributes nothing is noise, not information —
+  // "0% via SwapBook" must never render.
+  const segments = (route.segments ?? []).filter((s) => {
+    try { return BigInt(s.amountIn) > 0n; } catch { return false; }
+  });
+  if (segments.length === 0) return null;
 
   const totalIn = parseInt(route.amountIn);
   const inSym = route.tokenInSymbol ?? '';
@@ -76,7 +81,7 @@ export default function RoutePreview({ route }: RoutePreviewProps) {
           marginBottom: '14px',
         }}
       >
-        {route.segments.map((seg, i) => {
+        {segments.map((seg, i) => {
           const pct = (parseInt(seg.amountIn) / totalIn) * 100;
           return (
             <div
@@ -97,7 +102,7 @@ export default function RoutePreview({ route }: RoutePreviewProps) {
           "$10,000". Per-segment effectiveBps was also dropped: it compared
           token-in units to token-out units, meaningless off stable pairs.) */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-        {route.segments.map((seg, i) => {
+        {segments.map((seg, i) => {
           const pct = (parseInt(seg.amountIn) / totalIn) * 100;
           return (
             <div
