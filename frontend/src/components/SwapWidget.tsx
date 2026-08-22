@@ -300,6 +300,7 @@ function TokenDropdown({
 function InputPanel({
   label,
   sublabel,
+  onSublabelClick,
   value,
   onChange,
   readOnly,
@@ -309,6 +310,7 @@ function InputPanel({
   excludeToken,
   accent,
 }: {
+  onSublabelClick?: () => void;
   label: string;
   sublabel?: string;
   value: string;
@@ -340,7 +342,18 @@ function InputPanel({
           </span>
         </div>
         {sublabel && (
-          <span style={{ fontSize: '12px', color: '#565b68' }}>{sublabel}</span>
+          <span
+            onClick={onSublabelClick}
+            title={onSublabelClick ? 'Use full balance' : undefined}
+            style={{
+              fontSize: '12px',
+              color: onSublabelClick ? '#8a8f9c' : '#565b68',
+              cursor: onSublabelClick ? 'pointer' : 'default',
+              textDecoration: onSublabelClick ? 'underline dotted' : 'none',
+            }}
+          >
+            {sublabel}
+          </span>
         )}
       </div>
 
@@ -492,17 +505,57 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     },
     [walletAddress, balances, allTokens]
   );
+
+  // Click-the-balance → fill the sell field with the FULL balance (all
+  // digits, no display rounding — one click, no dust left behind). XLM
+  // keeps a 2 XLM buffer for the base reserve + transaction fees.
+  const fillMaxBalance = useCallback(() => {
+    const raw = balances[tokenIn];
+    if (raw === undefined) return;
+    let max = raw;
+    if (tokenIn === 'XLM') {
+      const n = parseFloat(raw) - 2;
+      if (n <= 0) return;
+      max = n.toFixed(7).replace(/0+$/, '').replace(/\.$/, '');
+    }
+    setAmountIn(max);
+    setQuote(null);
+    setP2pPlan(null);
+  }, [balances, tokenIn]);
+  // Load the live token universe. RETRIES matter: a single failed fetch
+  // (e.g. the backend restarting right after a deploy) used to strand the
+  // UI on the 6-token curated fallback until a hard refresh. Retry with
+  // backoff, and refresh when the tab regains focus.
+  const assetsLoaded = useRef(false);
   useEffect(() => {
-    import('@/lib/api').then(({ getAssetsFull }) =>
-      getAssetsFull().then(({ assets, p2pAllowed: corridor }) => {
+    let cancelled = false;
+    const load = async (attempt: number) => {
+      try {
+        const { getAssetsFull } = await import('@/lib/api');
+        const { assets, p2pAllowed: corridor } = await getAssetsFull();
+        if (cancelled) return;
         if (Array.isArray(assets) && assets.length > 0) {
           const mapped = assets.map(assetToToken);
           mapped.sort((a, b) => (b.venueVolume ?? 0) - (a.venueVolume ?? 0));
           setAllTokens(mapped);
+          assetsLoaded.current = true;
         }
         if (Array.isArray(corridor) && corridor.length > 0) setP2pAllowed(corridor);
-      })
-    ).catch(() => {});
+      } catch {
+        if (!cancelled && attempt < 6) {
+          setTimeout(() => load(attempt + 1), 2000 * (attempt + 1));
+        }
+      }
+    };
+    load(0);
+    const onFocus = () => {
+      if (!assetsLoaded.current) load(0);
+    };
+    window.addEventListener('focus', onFocus);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', onFocus);
+    };
   }, []);
 
   const p2pTokens = allTokens.filter((t) => p2pAllowed.includes(t.symbol));
@@ -818,6 +871,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
         <InputPanel
           label="Selling"
           sublabel={balanceLabel(tokenIn)}
+          onSublabelClick={balances[tokenIn] !== undefined ? fillMaxBalance : undefined}
           value={amountIn}
           onChange={(v) => { setAmountIn(v); setP2pPlan(null); }}
           token={tokenIn}

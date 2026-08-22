@@ -741,12 +741,14 @@ app.post('/api/swap/build', async (req, res) => {
           minTotalOut: ((blend.blendNet * BigInt(10000 - slippage)) / 10000n).toString(),
           blendedBps: Number(((amountIn - blend.blendNet) * 10000n) / amountIn),
           blendGain: blend.gain.toString(),
-          segments: blend.mixed.segments.map((s) => ({
-            venue: s.venueId === 3 ? 'StellarDEX (classic)' : s.venueName,
-            venueId: s.venueId,
-            amountIn: s.amountIn.toString(),
-            expectedOut: s.expectedAmountOut.toString(),
-          })),
+          segments: blend.mixed.segments
+            .filter((s) => s.amountIn > 0n)
+            .map((s) => ({
+              venue: s.venueId === 3 ? 'StellarDEX (classic)' : s.venueName,
+              venueId: s.venueId,
+              amountIn: s.amountIn.toString(),
+              expectedOut: s.expectedAmountOut.toString(),
+            })),
         },
       });
       return;

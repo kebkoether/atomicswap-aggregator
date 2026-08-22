@@ -74,14 +74,11 @@ export const TOKENS: Record<string, TokenConfig> = {
     decimals: 7,
     status: 'coming_soon',
   },
-  SolvBTC: {
-    symbol: 'SolvBTC',
-    name: 'Solv Protocol BTC',
-    issuer: '', // Solv's Stellar deployment is paused pending LayerZero — do not mark live
-    sacAddress: '',
-    decimals: 7,
-    status: 'coming_soon',
-  },
+  // SolvBTC placeholder removed 2026-08-22: Solv assets ARE live on the
+  // DEXes (xSolvBTC on Aqua, SOLVBTC on Sushi) and venue discovery lists
+  // them directly — a curated 'coming_soon' entry with no SAC only
+  // rendered a dead row AND spoof-blocked the real discovered token
+  // (curated symbols suppress same-symbol discovered tokens by design).
 };
 
 // ── Environment overrides ────────────────────────────────────────────
