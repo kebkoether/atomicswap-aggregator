@@ -515,6 +515,16 @@ app.get('/api/assets', (_req, res) => {
       }
     } catch {}
   }
+  // With the v1.1 contracts (Sushi adapter resolves pools via the factory,
+  // no per-pair registration), every discovered Sushi pair is TWAP-able.
+  // Against v1.0 only registered pairs can execute slices, so gate on the
+  // same flag that switches the rest of the backend to v1.1.
+  if (config.swapbookV11) {
+    for (const p of tokenDiscovery.getSushiPairs()) {
+      eligibleSacs.add(p.tokenA);
+      eligibleSacs.add(p.tokenB);
+    }
+  }
   res.json({
     assets: tokenDiscovery.getTokens().map((t) => ({
       ...t,
@@ -553,13 +563,15 @@ app.get('/api/quote', async (req, res) => {
       swapBookAmountOut: route.swapBookAmountOut.toString(),
       blendedBps: route.blendedBps,
       priceImpactBps: route.priceImpactBps,
-      segments: route.segments.map((s) => ({
-        venue: s.venueName,
-        venueId: s.venueId,
-        amountIn: s.amountIn.toString(),
-        expectedOut: s.expectedAmountOut.toString(),
-        effectiveBps: s.effectiveBps,
-      })),
+      segments: route.segments
+        .filter((s) => s.amountIn > 0n)
+        .map((s) => ({
+          venue: s.venueName,
+          venueId: s.venueId,
+          amountIn: s.amountIn.toString(),
+          expectedOut: s.expectedAmountOut.toString(),
+          effectiveBps: s.effectiveBps,
+        })),
       instructions: route.instructions.map((i) => ({
         venueContractId: i.venueContractId,
         venueId: i.venueId,
@@ -1334,6 +1346,47 @@ app.get('/api/oracle/price', (req, res) => {
 /**
  * GET /api/health
  */
+/**
+ * GET /api/balances/:address — balances for Soroban-native tokens in the
+ * universe (no classic issuer → invisible to Horizon). Simulates
+ * token.balance(address) per token; returns DISPLAY units as strings
+ * (decimal-scaled server-side so the UI never touches raw 18-dec values).
+ */
+app.get('/api/balances/:address', async (req, res) => {
+  try {
+    const address = parseStellarAccount(req.params.address, 'address');
+    const sorobanNative = tokenDiscovery
+      .getTokens()
+      .filter((t) => t.sacAddress && !t.issuer && t.symbol !== 'XLM');
+    const balances = await Promise.all(
+      sorobanNative.map(async (t) => {
+        try {
+          const raw = await stellar.simulateAndParse<bigint>(
+            t.sacAddress,
+            'balance',
+            [StellarClient.toAddress(address)]
+          );
+          if (raw === null || raw === undefined) return null;
+          const v = BigInt(raw);
+          if (v === 0n) return null;
+          const base = 10n ** BigInt(t.decimals);
+          const whole = v / base;
+          const frac = ((v % base) * 10_000_000n) / base; // 7 display digits
+          return {
+            symbol: t.symbol,
+            balance: `${whole}.${frac.toString().padStart(7, '0')}`,
+          };
+        } catch {
+          return null;
+        }
+      })
+    );
+    res.json({ balances: balances.filter(Boolean) });
+  } catch (error) {
+    handleError(res, error, 'Failed to fetch balances');
+  }
+});
+
 /**
  * GET /api/screen/:address — connect-time compliance check for the UI.
  * Returns { allowed } so the frontend can refuse flagged wallets before

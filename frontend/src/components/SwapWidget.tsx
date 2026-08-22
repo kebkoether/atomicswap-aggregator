@@ -2,6 +2,8 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { toBaseUnits, fromBaseUnits, formatUnits } from '@/lib/units';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 import { useWallet } from '@/context/WalletContext';
 import { getQuote as fetchQuote, buildPeerSwap, getOraclePrice } from '@/lib/api';
 
@@ -142,13 +144,22 @@ function TokenDropdown({
 
   const selectedToken = tokens.find((t) => t.symbol === selected) || tokens[0];
   // Exclude the token on the other side; filter by search query.
-  // List arrives volume-sorted (hot first) from the widget.
+  // With a query, MATCH QUALITY ranks first (exact symbol, then symbol
+  // prefix, then symbol substring, then name match) — searching "deJAAA"
+  // must put deJAAA on top, not below whatever has more volume. Without
+  // a query the list keeps its volume-sorted (hot first) order.
   const q = query.trim().toLowerCase();
-  const available = tokens.filter(
-    (t) =>
-      t.symbol !== exclude &&
-      (!q || t.symbol.toLowerCase().includes(q) || t.name.toLowerCase().includes(q))
-  );
+  const matchRank = (t: Token): number => {
+    const sym = t.symbol.toLowerCase();
+    if (sym === q) return 0;
+    if (sym.startsWith(q)) return 1;
+    if (sym.includes(q)) return 2;
+    if (t.name.toLowerCase().includes(q)) return 3;
+    return 4;
+  };
+  const available = tokens
+    .filter((t) => t.symbol !== exclude && (!q || matchRank(t) < 4))
+    .sort((a, b) => (q ? matchRank(a) - matchRank(b) : 0));
 
   return (
     <div ref={ref} style={{ position: 'relative', zIndex: open ? 50 : 1 }}>
@@ -447,6 +458,20 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
           );
           if (match) next[match.symbol] = b.balance;
         }
+      }
+      // Soroban-native tokens (no classic issuer — e.g. deJAAA, deJTRSY)
+      // have no Horizon trustline; their balances come from the backend,
+      // which simulates token.balance() on-chain.
+      try {
+        const sres = await fetch(`${API_BASE}/api/balances/${walletAddress}`);
+        if (sres.ok) {
+          const sdata = await sres.json();
+          for (const b of sdata.balances ?? []) {
+            if (b.symbol && b.balance !== undefined) next[b.symbol] = b.balance;
+          }
+        }
+      } catch {
+        // Soroban balance fetch is best-effort
       }
       setBalances(next);
     } catch {
@@ -1196,10 +1221,14 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
             }}
           >
             {(() => {
-              // Live rate from the actual quote: tokenOut received per tokenIn.
-              const inAmt = Number(quote.amountIn ?? 0);
+              // Live rate from the actual quote: tokenOut received per
+              // tokenIn — in WHOLE tokens, not raw base units (a raw
+              // ratio is off by 10^(decOut-decIn) on mixed-decimal pairs
+              // like USDC/deJAAA).
+              const inTokens = fromBaseUnits(String(quote.amountIn ?? 0), decimalsOf(tokenIn));
+              const outTokens = fromBaseUnits(String(quote.netAmountOut ?? 0), decimalsOf(tokenOut));
               const outAmt = Number(quote.netAmountOut ?? 0);
-              const rate = inAmt > 0 ? outAmt / inAmt : 0;
+              const rate = inTokens > 0 ? outTokens / inTokens : 0;
               const rateStr = rate > 0
                 ? `1 ${tokenIn} ≈ ${rate.toLocaleString('en-US', { maximumSignificantDigits: 5 })} ${tokenOut}`
                 : '—';
