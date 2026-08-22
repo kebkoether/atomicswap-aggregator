@@ -2,14 +2,20 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror,
-    symbol_short, token, Address, Env, IntoVal, Symbol, Vec,
+    symbol_short, token, Address, Env, IntoVal, Symbol, Vec, I256,
 };
 
 /// Protocol fee per 100,000 of total output (rounded up). Admin-settable
-/// via set_fee, hard-capped at the deployed 0.5 bps.
+/// via set_fee, hard-capped at 0.5 bps. DEFAULTS TO ZERO — instant swaps
+/// are advertised as "venue fees only"; the cap exists so a fee could be
+/// enabled later without exceeding what users can verify on-chain.
 const MAX_FEE_PER_100K: i128 = 5;
-const DEFAULT_FEE_PER_100K: i128 = 5;
+const DEFAULT_FEE_PER_100K: i128 = 0;
 const FEE_DENOMINATOR: i128 = 100_000;
+
+/// Cap on the integrator partner fee: 1,000 per 100,000 = 100 bps = 1%.
+/// Matches the backend's MAX_PARTNER_FEE_BPS for classic legs.
+const MAX_PARTNER_FEE_PER_100K: i128 = 1_000;
 
 // ─── Storage Keys ───────────────────────────────────────
 
@@ -68,6 +74,7 @@ pub enum RouterError {
     SameToken = 10,
     SwapBookNotSet = 11,
     FeeAboveCap = 12,
+    PartnerFeeAboveCap = 13,
 }
 
 // ─── Contract ───────────────────────────────────────────
@@ -188,6 +195,48 @@ impl Router {
         min_total_out: i128,
         segments: Vec<RouteSegment>,
     ) -> Result<i128, RouterError> {
+        Self::route_inner(
+            &env, user, token_in, token_out, total_amount_in, min_total_out,
+            segments, None,
+        )
+    }
+
+    /// execute_route with an integrator partner fee carved from the
+    /// output ON TOP of the protocol fee — the partner's cut never comes
+    /// out of protocol revenue, and `min_total_out` protects the user
+    /// net of BOTH fees. `partner_fee_per_100k` is capped at 100 bps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_route_partner(
+        env: Env,
+        user: Address,
+        token_in: Address,
+        token_out: Address,
+        total_amount_in: i128,
+        min_total_out: i128,
+        segments: Vec<RouteSegment>,
+        partner: Address,
+        partner_fee_per_100k: i128,
+    ) -> Result<i128, RouterError> {
+        if !(0..=MAX_PARTNER_FEE_PER_100K).contains(&partner_fee_per_100k) {
+            return Err(RouterError::PartnerFeeAboveCap);
+        }
+        Self::route_inner(
+            &env, user, token_in, token_out, total_amount_in, min_total_out,
+            segments, Some((partner, partner_fee_per_100k)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn route_inner(
+        env: &Env,
+        user: Address,
+        token_in: Address,
+        token_out: Address,
+        total_amount_in: i128,
+        min_total_out: i128,
+        segments: Vec<RouteSegment>,
+        partner: Option<(Address, i128)>,
+    ) -> Result<i128, RouterError> {
         user.require_auth();
 
         if total_amount_in <= 0 || min_total_out <= 0 {
@@ -199,20 +248,26 @@ impl Router {
         Self::validate_segments(&segments, total_amount_in)?;
 
         // Pull total token_in from user
-        let token_in_client = token::Client::new(&env, &token_in);
+        let token_in_client = token::Client::new(env, &token_in);
         token_in_client.transfer(&user, env.current_contract_address(), &total_amount_in);
 
-        let total_out = Self::execute_segments(&env, &token_in, &token_out, &segments)?;
+        let total_out = Self::execute_segments(env, &token_in, &token_out, &segments)?;
 
-        // Protocol fee on total output (rounded up)
-        let fee = Self::calculate_fee(&env, total_out);
-        let user_receives = total_out - fee;
+        // Protocol fee on total output (rounded up), then the partner fee
+        let fee = Self::calculate_fee(env, total_out);
+        let partner_fee = match &partner {
+            Some((_, per_100k)) if *per_100k > 0 => {
+                Self::muldiv_ceil(env, total_out, *per_100k, FEE_DENOMINATOR)?
+            }
+            _ => 0,
+        };
+        let user_receives = total_out - fee - partner_fee;
 
         if user_receives < min_total_out {
             return Err(RouterError::InsufficientOutput);
         }
 
-        let token_out_client = token::Client::new(&env, &token_out);
+        let token_out_client = token::Client::new(env, &token_out);
         token_out_client.transfer(&env.current_contract_address(), &user, &user_receives);
         if fee > 0 {
             let fee_vault: Address = env
@@ -221,6 +276,14 @@ impl Router {
                 .get(&DataKey::FeeVault)
                 .ok_or(RouterError::NotInitialized)?;
             token_out_client.transfer(&env.current_contract_address(), &fee_vault, &fee);
+        }
+        if partner_fee > 0 {
+            let (partner_addr, _) = partner.as_ref().unwrap();
+            token_out_client.transfer(&env.current_contract_address(), partner_addr, &partner_fee);
+            env.events().publish(
+                (symbol_short!("route"), symbol_short!("partner")),
+                (partner_addr.clone(), partner_fee),
+            );
         }
 
         env.events().publish(
@@ -429,7 +492,17 @@ impl Router {
         if amount <= 0 || num == 0 {
             return 0;
         }
-        (amount * num + FEE_DENOMINATOR - 1) / FEE_DENOMINATOR
+        // 256-bit intermediate — parity with SwapBook's fee math
+        Self::muldiv_ceil(env, amount, num, FEE_DENOMINATOR).unwrap_or(i128::MAX)
+    }
+
+    /// ceil(a * b / d) via 256-bit intermediate — no i128 overflow.
+    fn muldiv_ceil(env: &Env, a: i128, b: i128, d: i128) -> Result<i128, RouterError> {
+        let num = I256::from_i128(env, a).mul(&I256::from_i128(env, b));
+        let r = num
+            .add(&I256::from_i128(env, d - 1))
+            .div(&I256::from_i128(env, d));
+        r.to_i128().ok_or(RouterError::InvalidAmount)
     }
 
     fn require_admin(env: &Env) -> Result<(), RouterError> {

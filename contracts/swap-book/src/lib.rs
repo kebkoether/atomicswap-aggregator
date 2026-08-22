@@ -21,6 +21,10 @@ const MAX_EXCLUDED: u32 = 5;
 /// seconds) and gets normalized.
 const SEP40_MS_THRESHOLD: u64 = 100_000_000_000;
 
+/// Max tolerated clock skew for a SEP-40 timestamp that is AHEAD of the
+/// ledger clock — further in the future is rejected as invalid.
+const SEP40_MAX_FUTURE_SKEW_SECS: u64 = 60;
+
 /// Basis-point denominator for slippage calculations
 const BPS_DENOMINATOR: i128 = 10_000;
 
@@ -491,12 +495,19 @@ impl SwapBook {
         let mut spent: i128 = 0;
         for i in 0..fills.len() {
             let spec = fills.get(i).unwrap();
+            // Validate amounts BEFORE budget accounting — a negative
+            // amount_out must never be able to shrink `spent`.
+            if spec.fill_amount_in <= 0 || spec.amount_out <= 0 {
+                return Err(SwapBookError::InvalidAmount);
+            }
             let order: Order = Self::read_order(&env, spec.order_id)?;
             // Must be the reverse side of the pair being placed
             if order.token_in != token_out || order.token_out != token_in {
                 return Err(SwapBookError::MatchWrongPair);
             }
-            spent += spec.amount_out;
+            spent = spent
+                .checked_add(spec.amount_out)
+                .ok_or(SwapBookError::Overflow)?;
             if spent > amount_in {
                 return Err(SwapBookError::MatchExceedsBudget);
             }
@@ -906,11 +917,24 @@ impl SwapBook {
             if let (Some(feed_in), Some(feed_out)) = (feed_in, feed_out) {
                 let p_in = Self::sep40_lastprice(env, &oracle, feed_in)?;
                 let p_out = Self::sep40_lastprice(env, &oracle, feed_out)?;
-                // Cross rate: both quotes share the oracle's base and
-                // decimals, so they cancel in the ratio.
+                // Cross rate. The ORACLE's price decimals cancel in the
+                // ratio, but the two TOKENS' own decimals do not: the fair
+                // value is computed as amount_in * num / den where
+                // amount_in is in token_in base units and the result must
+                // be token_out base units — so scale by each token's
+                // decimals. (For the common all-7-decimals corridor the
+                // factors cancel and this is a no-op.)
+                let dec_in = token::Client::new(env, token_in).decimals();
+                let dec_out = token::Client::new(env, token_out).decimals();
+                let num = p_in
+                    .checked_mul(Self::pow10(dec_out)?)
+                    .ok_or(SwapBookError::Overflow)?;
+                let den = p_out
+                    .checked_mul(Self::pow10(dec_in)?)
+                    .ok_or(SwapBookError::Overflow)?;
                 return Ok(OraclePriceData {
-                    num: p_in,
-                    den: p_out,
+                    num,
+                    den,
                     // Timestamp freshness was just enforced against
                     // max_age; the ledger-sequence staleness check is
                     // satisfied by construction for SEP-40 reads.
@@ -954,7 +978,19 @@ impl SwapBook {
         if now.saturating_sub(ts) > max_age {
             return Err(SwapBookError::OraclePriceStale);
         }
+        // A future-dated timestamp is as suspect as a stale one — a buggy
+        // feed must not bypass the freshness gate by reporting ahead of
+        // the ledger clock (small skew tolerated).
+        if ts > now.saturating_add(SEP40_MAX_FUTURE_SKEW_SECS) {
+            return Err(SwapBookError::OraclePriceStale);
+        }
         Ok(price.price)
+    }
+
+    /// 10^exp as i128; rejects exponents that could not fit (token
+    /// decimals above 38 are not representable).
+    fn pow10(exp: u32) -> Result<i128, SwapBookError> {
+        10i128.checked_pow(exp).ok_or(SwapBookError::Overflow)
     }
 
     fn check_oracle_fresh(env: &Env, price: &OraclePriceData) -> Result<(), SwapBookError> {
