@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useCallback, useRef, useEffect } from 'react';
+import { toBaseUnits, fromBaseUnits, formatUnits } from '@/lib/units';
 import { useWallet } from '@/context/WalletContext';
 import { getQuote as fetchQuote, buildPeerSwap, getOraclePrice } from '@/lib/api';
 
@@ -20,6 +21,8 @@ interface Token {
   verified?: boolean;
   /** Aggregate venue volume — powers hot-first ordering */
   venueVolume?: number;
+  /** Token decimals (7 for SACs; Soroban-native tokens can differ) */
+  decimals?: number;
   /** Has a registered venue pool → allowed in the TWAP tab */
   twapEligible?: boolean;
 }
@@ -60,6 +63,7 @@ function assetToToken(asset: any): Token {
     status: asset.status,
     sacAddress: asset.sacAddress || undefined,
     issuer: asset.issuer || undefined,
+    decimals: asset.decimals ?? 7,
     verified: asset.verified ?? asset.source === 'curated',
     venueVolume: asset.venueVolume ?? 0,
     twapEligible: asset.twapEligible ?? false,
@@ -412,6 +416,13 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
   // hot-first: sorted by venue volume so the tokens people actually trade sit
   // at the top of the dropdown. Falls back to the curated list offline.
   const [allTokens, setAllTokens] = useState<Token[]>(TOKENS);
+
+  // Decimal-aware conversions — Sushi-discovered Soroban tokens (deJTRSY,
+  // deJAAA, ...) are 18 decimals, not the SAC-standard 7.
+  const decimalsOf = useCallback(
+    (symbol: string) => allTokens.find((t) => t.symbol === symbol)?.decimals ?? 7,
+    [allTokens]
+  );
   const [p2pAllowed, setP2pAllowed] = useState<string[]>(P2P_ALLOWED_FALLBACK);
 
   // Wallet balances by symbol, from Horizon. XLM matches the native line;
@@ -510,11 +521,17 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
       debounceRef.current = setTimeout(async () => {
         try {
           setLoading(true);
-          const baseAmount = Math.floor(parseFloat(amount) * 1e7).toString();
+          const baseAmount = toBaseUnits(amount, decimalsOf(tIn));
           const data = await fetchQuote(tokenParam(tIn), tokenParam(tOut), baseAmount);
           setQuote(data);
           // Symbols ride along so RoutePreview can label amounts correctly
-          onRouteComputed({ ...data, tokenInSymbol: tIn, tokenOutSymbol: tOut });
+          onRouteComputed({
+            ...data,
+            tokenInSymbol: tIn,
+            tokenOutSymbol: tOut,
+            tokenInDecimals: decimalsOf(tIn),
+            tokenOutDecimals: decimalsOf(tOut),
+          });
         } catch (error) {
           console.error('Quote error:', error);
         } finally {
@@ -546,7 +563,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     if (!amountIn || parseFloat(amountIn) <= 0) return;
     setLoading(true);
     try {
-      const baseAmount = Math.floor(parseFloat(amountIn) * 1e7).toString();
+      const baseAmount = toBaseUnits(amountIn, decimalsOf(tokenIn));
       const data = await buildPeerSwap({
         sourceAddress: walletAddress || 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
         tokenIn,
@@ -571,7 +588,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     setSubmitting(true);
     try {
       const { buildTwap, submitTransaction } = await import('@/lib/api');
-      const baseAmount = Math.floor(parseFloat(amountIn) * 1e7).toString();
+      const baseAmount = toBaseUnits(amountIn, decimalsOf(tokenIn));
       const { xdr, plan } = await buildTwap({
         sourceAddress: walletAddress,
         tokenIn: tokenParam(tokenIn),
@@ -604,7 +621,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     if (!walletAddress || !p2pPlan) return;
     setSubmitting(true);
     try {
-      const baseAmount = Math.floor(parseFloat(amountIn) * 1e7).toString();
+      const baseAmount = toBaseUnits(amountIn, decimalsOf(tokenIn));
       const data = await buildPeerSwap({
         sourceAddress: walletAddress,
         tokenIn,
@@ -645,7 +662,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
     setSubmitting(true);
     try {
       const { buildSwap, submitTransaction } = await import('@/lib/api');
-      const baseAmount = Math.floor(parseFloat(amountIn) * 1e7).toString();
+      const baseAmount = toBaseUnits(amountIn, decimalsOf(tokenIn));
       // The backend picks the best execution: Soroban route (Aqua/Sushi via
       // the Router contract) or a classic SDEX path payment — either way
       // it's one XDR to sign.
@@ -706,10 +723,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
 
   const formatOutput = (raw: string) => {
     if (!raw) return '0.00';
-    return (parseInt(raw) / 1e7).toLocaleString('en-US', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    });
+    return formatUnits(raw, decimalsOf(tokenOut));
   };
 
   return (
@@ -1130,14 +1144,14 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
                     </div>
                     <div style={{ marginBottom: '6px' }}>
                       <strong style={{ color: '#e1e4ea' }}>
-                        {(parseInt(p2pPlan.summary.instantFillAmount) / 1e7).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} {tokenOut}
+                        {formatUnits(p2pPlan.summary.instantFillAmount, decimalsOf(tokenOut))} {tokenOut}
                       </strong>{' '}
                       fills instantly at <strong style={{ color: '#22c55e' }}>0.5 bps</strong>.
                     </div>
                     {p2pPlan.remainder && (
                       <div style={{ fontSize: '12px', color: '#eab308' }}>
                         Remaining{' '}
-                        <strong>{(parseInt(p2pPlan.remainder.amountIn) / 1e7).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} {tokenIn}</strong>{' '}
+                        <strong>{formatUnits(p2pPlan.remainder.amountIn, decimalsOf(tokenIn))} {tokenIn}</strong>{' '}
                         will be escrowed on-chain waiting for a future match.
                       </div>
                     )}
@@ -1195,7 +1209,7 @@ export default function SwapWidget({ onRouteComputed }: SwapWidgetProps) {
               // Total cost in OUTPUT-TOKEN units — concrete beats abstract.
               // $-prefixed only when the output token is a USD stable.
               const totalBps = impactBps + feeBps;
-              const costUnits = (totalBps / 10000) * (outAmt / 1e7);
+              const costUnits = (totalBps / 10000) * fromBaseUnits(String(outAmt), decimalsOf(tokenOut));
               const isUsdStable = ['USDC', 'PYUSD', 'USDT0', 'USDY'].includes(tokenOut);
               const costStr = costUnits > 0
                 ? `≈ ${isUsdStable ? '$' : ''}${costUnits.toLocaleString('en-US', { maximumFractionDigits: costUnits < 1 ? 4 : 2 })}${isUsdStable ? '' : ' ' + tokenOut} (${totalBps.toFixed(1)} bps)`

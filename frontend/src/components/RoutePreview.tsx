@@ -14,9 +14,11 @@ interface RoutePreviewProps {
     blendedBps: number;
     /** True price impact vs small-size spot rate (unit-safe) */
     priceImpactBps?: number;
-    /** Symbols attached by SwapWidget for labeling amounts */
+    /** Symbols + decimals attached by SwapWidget for labeling amounts */
     tokenInSymbol?: string;
     tokenOutSymbol?: string;
+    tokenInDecimals?: number;
+    tokenOutDecimals?: number;
   };
 }
 
@@ -28,11 +30,10 @@ const VENUE_COLORS: Record<string, string> = {
   Curve: '#eab308',
 };
 
-function fmtAmount(raw: string): string {
-  return (parseInt(raw) / 1e7).toLocaleString('en-US', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
+import { formatUnits } from '@/lib/units';
+
+function fmtAmount(raw: string, decimals: number): string {
+  return formatUnits(raw, decimals);
 }
 
 export default function RoutePreview({ route }: RoutePreviewProps) {
@@ -124,9 +125,9 @@ export default function RoutePreview({ route }: RoutePreviewProps) {
                 </span>
               </div>
               <span style={{ fontSize: '13px', color: '#8a8f9c' }}>
-                {fmtAmount(seg.amountIn)}{inSym ? ` ${inSym}` : ''}
+                {fmtAmount(seg.amountIn, route.tokenInDecimals ?? 7)}{inSym ? ` ${inSym}` : ''}
                 <span style={{ color: '#565b68' }}> → </span>
-                {fmtAmount(seg.expectedOut)}{outSym ? ` ${outSym}` : ''}
+                {fmtAmount(seg.expectedOut, route.tokenOutDecimals ?? 7)}{outSym ? ` ${outSym}` : ''}
               </span>
             </div>
           );

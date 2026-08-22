@@ -10,8 +10,12 @@
  * The contract enforces min_amount_out at execution, so a spot-based
  * estimate with slippage margin is safe for routing.
  *
- * Pairs are configured via SUSHI_PAIRS env (JSON):
- *   [{"tokenA":"<SAC>","tokenB":"<SAC>","pool":"<C...>","fee":3000}]
+ * Pairs come from TWO sources, merged:
+ *   1. Dynamic discovery (TokenDiscoveryService's Sushi pool sweep) —
+ *      refreshed continuously, covers every pool Sushi itself lists.
+ *   2. SUSHI_PAIRS env (JSON) as a static override/fallback:
+ *      [{"tokenA":"<SAC>","tokenB":"<SAC>","pool":"<C...>","fee":3000}]
+ * Env entries win on conflict (lets ops pin a specific pool).
  */
 
 import { VenueAdapter, Quote, DepthQuote, SwapInstruction } from './adapter.js';
@@ -25,39 +29,67 @@ interface SushiPair {
   tokenB: string;
   pool: string;
   fee: number;
+  /** Token decimals (default 7) — sizes the depth haircut correctly for
+   *  18-decimal Soroban tokens like deJTRSY/deJAAA. */
+  decimalsA?: number;
+  decimalsB?: number;
 }
+
+/** Live pair source (the discovery service), checked before env pairs. */
+export type SushiPairsProvider = () => SushiPair[];
 
 export class SushiSwapAdapter implements VenueAdapter {
   readonly name = 'SushiSwap';
   readonly venueId = 2;
   readonly executable = true; // mainnet-verified via direct pool.swap
   private stellar: StellarClient;
-  private pairs: SushiPair[] = [];
+  private envPairs: SushiPair[] = [];
+  private pairsProvider: SushiPairsProvider | null;
   private token0Cache = new Map<string, string>(); // pool -> token0
 
   constructor(
     private adapterContractId: string,
     stellar: StellarClient,
-    pairsJson?: string
+    pairsJson?: string,
+    pairsProvider?: SushiPairsProvider
   ) {
     this.stellar = stellar;
+    this.pairsProvider = pairsProvider ?? null;
     try {
-      if (pairsJson) this.pairs = JSON.parse(pairsJson);
+      if (pairsJson) this.envPairs = JSON.parse(pairsJson);
     } catch {
-      console.warn('[Sushi] SUSHI_PAIRS env is not valid JSON — no pairs configured');
+      console.warn('[Sushi] SUSHI_PAIRS env is not valid JSON — ignored');
     }
   }
 
+  private allPairs(): SushiPair[] {
+    const dynamic = this.pairsProvider ? this.pairsProvider() : [];
+    // Env pairs win on conflict (ops override), so they go last in the
+    // merged map keyed by the unordered pair.
+    const merged = new Map<string, SushiPair>();
+    for (const p of [...dynamic, ...this.envPairs]) {
+      merged.set([p.tokenA, p.tokenB].sort().join('|'), p);
+    }
+    return Array.from(merged.values());
+  }
+
   async isAvailable(): Promise<boolean> {
-    return this.pairs.length > 0;
+    return this.allPairs().length > 0;
   }
 
   private findPair(tokenIn: string, tokenOut: string): SushiPair | undefined {
-    return this.pairs.find(
+    return this.allPairs().find(
       (p) =>
         (p.tokenA === tokenIn && p.tokenB === tokenOut) ||
         (p.tokenA === tokenOut && p.tokenB === tokenIn)
     );
+  }
+
+  /** Decimals of a given token within a pair (default 7). */
+  private static decimalsFor(pair: SushiPair, token: string): number {
+    if (token === pair.tokenA) return pair.decimalsA ?? 7;
+    if (token === pair.tokenB) return pair.decimalsB ?? 7;
+    return 7;
   }
 
   private async token0(pool: string): Promise<string | null> {
@@ -86,7 +118,8 @@ export class SushiSwapAdapter implements VenueAdapter {
     if (sqrtP === 0n) return 0n;
 
     const feeKeep = FEE_DENOM - BigInt(pair.fee);
-    // price of token1 in token0 terms = (sqrtP/Q96)^2; both sides 7 decimals
+    // price of token1 in token0 terms = (sqrtP/Q96)^2 in RAW base units
+    // (sqrtP already encodes any decimals difference between the tokens)
     if (tokenIn === t0) {
       // token0 -> token1: out = in * sqrtP^2 / Q96^2
       return (amountIn * sqrtP * sqrtP * feeKeep) / (Q96 * Q96 * FEE_DENOM);
@@ -120,12 +153,16 @@ export class SushiSwapAdapter implements VenueAdapter {
     // Spot price doesn't model tick-range depth; charge a soft impact
     // haircut that grows with size so the greedy allocator doesn't dump
     // the whole order here. The contract's min_out guards execution.
+    const pair = this.findPair(tokenIn, tokenOut);
+    const decIn = pair ? SushiSwapAdapter.decimalsFor(pair, tokenIn) : 7;
+    // 1 bp per 10,000 WHOLE input tokens — decimal-aware so 18-decimal
+    // tokens aren't annihilated by a base-unit divisor tuned for 7.
+    const haircutUnit = 10_000n * 10n ** BigInt(decIn);
     const quotes: DepthQuote[] = [];
     for (const amount of amounts) {
       let amountOut = await this.spotQuote(tokenIn, tokenOut, amount);
       if (amountOut > 0n) {
-        // 1 bp haircut per $10k of size (7-decimals base units)
-        const haircutBps = amount / 100_000_0000000n;
+        const haircutBps = amount / haircutUnit;
         amountOut -= (amountOut * haircutBps) / 10000n;
       }
       const marginalBps =

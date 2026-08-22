@@ -33,7 +33,14 @@ pub enum DataKey {
     SushiQuoter,
     /// Registered (fee tier, pool address) for a directed pair
     Pair(Address, Address),
+    /// Sushi factory — enables permissionless pair resolution: pairs the
+    /// admin never registered fall back to factory.get_pool lookups.
+    SushiFactory,
 }
+
+/// Fee tiers probed (most liquid first) when resolving a pair through the
+/// factory. Mirrors Uniswap-V3 canonical tiers as deployed by Sushi.
+const FACTORY_FEE_TIERS: [u32; 4] = [3000, 500, 10_000, 100];
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -80,10 +87,24 @@ pub struct SushiSwapAdapter;
 #[contractimpl]
 impl SushiSwapAdapter {
     /// Deploy-time constructor.
-    pub fn __constructor(env: Env, admin: Address, sushi_router: Address, sushi_quoter: Address) {
+    pub fn __constructor(
+        env: Env,
+        admin: Address,
+        sushi_router: Address,
+        sushi_quoter: Address,
+        sushi_factory: Address,
+    ) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::SushiRouter, &sushi_router);
         env.storage().instance().set(&DataKey::SushiQuoter, &sushi_quoter);
+        env.storage().instance().set(&DataKey::SushiFactory, &sushi_factory);
+    }
+
+    /// Update the factory address. Admin only.
+    pub fn set_factory(env: Env, sushi_factory: Address) -> Result<(), SushiAdapterError> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::SushiFactory, &sushi_factory);
+        Ok(())
     }
 
     /// Register the pool (fee tier + pool contract) for a pair, both
@@ -266,14 +287,47 @@ impl SushiSwapAdapter {
         Ok(())
     }
 
+    /// Resolve the pool for a pair: an admin-registered entry wins (lets
+    /// ops pin a specific pool); otherwise ask the Sushi factory across
+    /// the canonical fee tiers — so every pool Sushi creates is tradeable
+    /// here PERMISSIONLESSLY, no per-pair admin action. Safe because the
+    /// caller's min_amount_out bounds the outcome regardless of which
+    /// pool executes.
     fn get_pair(
         env: &Env,
         token_in: &Address,
         token_out: &Address,
     ) -> Result<PairInfo, SushiAdapterError> {
-        env.storage()
+        if let Some(info) = env
+            .storage()
             .persistent()
             .get(&DataKey::Pair(token_in.clone(), token_out.clone()))
-            .ok_or(SushiAdapterError::PairNotSet)
+        {
+            return Ok(info);
+        }
+        let factory: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SushiFactory)
+            .ok_or(SushiAdapterError::PairNotSet)?;
+        for fee in FACTORY_FEE_TIERS {
+            let pool: Option<Address> = env.invoke_contract(
+                &factory,
+                &Symbol::new(env, "get_pool"),
+                soroban_sdk::vec![
+                    env,
+                    token_in.into_val(env),
+                    token_out.into_val(env),
+                    fee.into_val(env),
+                ],
+            );
+            if let Some(pool) = pool {
+                return Ok(PairInfo { fee, pool });
+            }
+        }
+        Err(SushiAdapterError::PairNotSet)
     }
 }
+
+#[cfg(test)]
+mod test;

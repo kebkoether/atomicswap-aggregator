@@ -2,12 +2,16 @@
  * Token Discovery Service
  *
  * Aggregates the tradeable token universe from venue liquidity instead of
- * a purely hardcoded list: any token with a real pool on Aqua shows up in
- * the aggregator UI automatically, pointing at that venue's liquidity.
- * (Sushi discovery slots in the same way once their Stellar API/ABI is
- * verified.)
+ * a purely hardcoded list: any token with a real pool on Aqua or
+ * SushiSwap-on-Stellar shows up in the aggregator UI automatically,
+ * pointing at that venue's liquidity.
  *
- * Source: Aqua pools API — GET {aquaApiUrl}/pools/?page=N&size=M
+ * Sources:
+ *   Aqua pools API — GET {aquaApiUrl}/pools/?page=N&size=M
+ *   Sushi data API — POST {sushiGraphqlUrl} query { stellarPools(chainId: -4) }
+ *     (the same GraphQL endpoint sushi.com's own frontend uses; carries
+ *     token symbol/name/DECIMALS — Sushi lists 18-decimal Soroban tokens
+ *     like deJTRSY/deJAAA that never appear on Aqua)
  *   Each pool carries tokens_addresses (SACs), tokens_str ("CODE:ISSUER"
  *   or "native"), index (pool hash for swap_chained), address (pool
  *   contract for estimate_swap), tx_count and total_volume.
@@ -22,6 +26,18 @@
  */
 
 import { TOKENS, TokenConfig } from '../stellar/tokens.js';
+
+export interface SushiPool {
+  poolAddress: string;
+  /** V3 fee in parts-per-million (500 / 3000 / 10000) */
+  fee: number;
+  liquidityUsd: number;
+  volumeUsd1d: number;
+  tokenA: string;
+  tokenB: string;
+  decimalsA: number;
+  decimalsB: number;
+}
 
 export interface AquaPool {
   poolHash: string;
@@ -42,7 +58,7 @@ export interface AggregatedToken {
   decimals: number;
   status: 'live' | 'coming_soon';
   /** Where this listing came from */
-  source: 'curated' | 'aqua';
+  source: 'curated' | 'aqua' | 'sushi';
   /** Curated entries are verified; venue-discovered ones are not */
   verified: boolean;
   /**
@@ -56,24 +72,33 @@ export interface AggregatedToken {
 
 export class TokenDiscoveryService {
   private aquaApiUrl: string;
+  private sushiGraphqlUrl: string;
   private intervalMs: number;
   private minTxCount: number;
+  private minSushiLiquidityUsd: number;
   private timer: ReturnType<typeof setInterval> | null = null;
   private pools: AquaPool[] = [];
+  private sushiPools: SushiPool[] = [];
   /** sacAddress -> discovered token */
   private discovered: Map<string, AggregatedToken> = new Map();
   private lastRefresh: Date | null = null;
 
   constructor(opts: {
     aquaApiUrl: string;
+    /** Sushi data GraphQL endpoint ('' disables Sushi discovery) */
+    sushiGraphqlUrl?: string;
     /** Refresh interval (default: 10 min) */
     intervalMs?: number;
-    /** Ignore pools with fewer transactions than this (spam floor) */
+    /** Ignore Aqua pools with fewer transactions than this (spam floor) */
     minTxCount?: number;
+    /** Ignore Sushi pools below this USD liquidity (spam floor, default $500) */
+    minSushiLiquidityUsd?: number;
   }) {
     this.aquaApiUrl = opts.aquaApiUrl.replace(/\/$/, '');
+    this.sushiGraphqlUrl = (opts.sushiGraphqlUrl ?? '').replace(/\/$/, '');
     this.intervalMs = opts.intervalMs ?? 10 * 60 * 1000;
     this.minTxCount = opts.minTxCount ?? 10;
+    this.minSushiLiquidityUsd = opts.minSushiLiquidityUsd ?? 500;
   }
 
   start(): void {
@@ -143,6 +168,34 @@ export class TokenDiscoveryService {
     return map;
   }
 
+  /**
+   * Best Sushi pool per discovered pair (highest USD liquidity), for the
+   * Sushi venue adapter's dynamic pair table.
+   */
+  getSushiPairs(): Array<{
+    tokenA: string;
+    tokenB: string;
+    pool: string;
+    fee: number;
+    decimalsA: number;
+    decimalsB: number;
+  }> {
+    const best = new Map<string, SushiPool>();
+    for (const p of this.sushiPools) {
+      const key = [p.tokenA, p.tokenB].sort().join('|');
+      const prev = best.get(key);
+      if (!prev || p.liquidityUsd > prev.liquidityUsd) best.set(key, p);
+    }
+    return Array.from(best.values()).map((p) => ({
+      tokenA: p.tokenA,
+      tokenB: p.tokenB,
+      pool: p.poolAddress,
+      fee: p.fee,
+      decimalsA: p.decimalsA,
+      decimalsB: p.decimalsB,
+    }));
+  }
+
   /** All discovered pools containing both SACs (for adapter registration/quotes). */
   getPoolsForPair(sacA: string, sacB: string): AquaPool[] {
     return this.pools.filter(
@@ -150,9 +203,10 @@ export class TokenDiscoveryService {
     );
   }
 
-  getStatus(): { pools: number; discovered: number; lastRefresh: string | null } {
+  getStatus(): { pools: number; sushiPools: number; discovered: number; lastRefresh: string | null } {
     return {
       pools: this.pools.length,
+      sushiPools: this.sushiPools.length,
       discovered: this.discovered.size,
       lastRefresh: this.lastRefresh?.toISOString() ?? null,
     };
@@ -175,6 +229,99 @@ export class TokenDiscoveryService {
   }
 
   private async refresh(): Promise<void> {
+    // Each source keeps its previous snapshot on failure — one venue's
+    // API outage never blanks the other's tokens.
+    await Promise.all([
+      this.refreshAqua().catch((err) =>
+        console.warn('[Discovery] Aqua refresh failed:', err)
+      ),
+      this.refreshSushi().catch((err) =>
+        console.warn('[Discovery] Sushi refresh failed:', err)
+      ),
+    ]);
+    this.lastRefresh = new Date();
+  }
+
+  /** Sushi pool sweep via the stellarPools GraphQL query (chainId -4). */
+  private async refreshSushi(): Promise<void> {
+    if (!this.sushiGraphqlUrl) return;
+    const res = await fetch(this.sushiGraphqlUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      signal: AbortSignal.timeout(15_000),
+      body: JSON.stringify({
+        query:
+          'query SP($c: ChainId!) { stellarPools(chainId: $c) { address swapFee liquidityUSD volumeUSD1d ' +
+          'token0 { address symbol name decimals } token1 { address symbol name decimals } } }',
+        variables: { c: -4 },
+      }),
+    });
+    if (!res.ok) {
+      console.warn(`[Discovery] Sushi GraphQL returned ${res.status}`);
+      return;
+    }
+    const body = (await res.json()) as {
+      data?: {
+        stellarPools?: Array<{
+          address: string;
+          swapFee: number;
+          liquidityUSD: number;
+          volumeUSD1d: number;
+          token0: { address: string; symbol: string; name: string; decimals: number };
+          token1: { address: string; symbol: string; name: string; decimals: number };
+        }>;
+      };
+      errors?: unknown;
+    };
+    const raw = body.data?.stellarPools;
+    if (!raw) {
+      console.warn('[Discovery] Sushi GraphQL: no stellarPools in response', body.errors ?? '');
+      return;
+    }
+
+    const pools: SushiPool[] = [];
+    const discovered = new Map<string, AggregatedToken>();
+    for (const p of raw) {
+      if ((p.liquidityUSD ?? 0) < this.minSushiLiquidityUsd) continue;
+      pools.push({
+        poolAddress: p.address,
+        fee: Math.round((p.swapFee ?? 0) * 1_000_000), // 0.0005 -> 500
+        liquidityUsd: p.liquidityUSD ?? 0,
+        volumeUsd1d: p.volumeUSD1d ?? 0,
+        tokenA: p.token0.address,
+        tokenB: p.token1.address,
+        decimalsA: p.token0.decimals ?? 7,
+        decimalsB: p.token1.decimals ?? 7,
+      });
+      for (const t of [p.token0, p.token1]) {
+        if (!t.address || discovered.has(t.address)) continue;
+        if (!t.symbol || t.symbol.length > 32) continue;
+        discovered.set(t.address, {
+          symbol: t.symbol,
+          name: t.name || t.symbol,
+          issuer: '',
+          sacAddress: t.address,
+          decimals: t.decimals ?? 7,
+          status: 'live',
+          source: 'sushi',
+          verified: false,
+          venueVolume: 0,
+        });
+      }
+    }
+
+    this.sushiPools = pools;
+    // Merge into the discovered map (Aqua entries win on SAC collision —
+    // they carry issuer info; anti-spoof vs curated happens in getTokens)
+    for (const [sac, token] of discovered) {
+      if (!this.discovered.has(sac)) this.discovered.set(sac, token);
+    }
+    console.log(
+      `[Discovery] Sushi: ${pools.length} pools (>= $${this.minSushiLiquidityUsd} liq) -> ${discovered.size} tokens`
+    );
+  }
+
+  private async refreshAqua(): Promise<void> {
     const pools: AquaPool[] = [];
     // Aqua serves small pages regardless of the size param — follow the
     // `next` links with a generous page cap.
@@ -247,10 +394,15 @@ export class TokenDiscoveryService {
     }
 
     this.pools = pools;
-    this.discovered = discovered;
-    this.lastRefresh = new Date();
+    // Rebuild: fresh Aqua entries replace stale ones; Sushi-only tokens
+    // survive (Sushi's own refresh keeps them current).
+    const merged = new Map<string, AggregatedToken>(discovered);
+    for (const [sac, token] of this.discovered) {
+      if (token.source === 'sushi' && !merged.has(sac)) merged.set(sac, token);
+    }
+    this.discovered = merged;
     console.log(
-      `[Discovery] Refreshed: ${pools.length} Aqua pools → ${discovered.size} tokens (≥${this.minTxCount} txs)`
+      `[Discovery] Aqua: ${pools.length} pools -> ${discovered.size} tokens (>=${this.minTxCount} txs)`
     );
   }
 
